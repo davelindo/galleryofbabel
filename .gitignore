@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+.swiftpm-cache/
+.swiftpm-config/
+.swiftpm-security/
+bin/
+.DS_Store
+.gallery-of-babel.json
+experiments/
