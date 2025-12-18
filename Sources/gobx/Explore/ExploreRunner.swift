@@ -29,6 +29,9 @@ enum ExploreRunner {
         let stateReset = options.stateReset
         let stateWriteEverySec = options.stateWriteEverySec
         let claimSize = options.claimSize
+        let uiEnabledArg = options.uiEnabled
+
+        let printLock = NSLock()
 
         if let c = count, c <= 0 {
             count = nil
@@ -39,9 +42,30 @@ enum ExploreRunner {
         let totalTarget: Int? = endless ? nil : max(1, count ?? 0)
         let total = totalTarget ?? 0
 
+        let uiEnabledFinal: Bool = {
+            if let v = uiEnabledArg { return v }
+            return Terminal.isInteractiveStdout()
+        }()
+
+        let uiRefreshEverySec: Double = {
+            guard uiEnabledFinal else { return reportEverySec }
+            if reportEverySec.isFinite, reportEverySec > 0 { return reportEverySec }
+            return 0.25
+        }()
+
+        let eventLog: ExploreEventLog? = uiEnabledFinal ? ExploreEventLog(capacity: 400) : nil
+
+        func emit(_ kind: ExploreEventKind = .info, _ message: String) {
+            if let eventLog {
+                eventLog.append(kind, message)
+            } else {
+                printLock.withLock { print(message) }
+            }
+        }
+
         let cpuFlushIntervalNs: UInt64 = {
             guard endless else { return 0 }
-            let sec = min(1.0, max(0.25, reportEverySec / 2.0))
+            let sec = min(1.0, max(0.25, uiRefreshEverySec / 2.0))
             return UInt64(sec * 1e9)
         }()
 
@@ -107,7 +131,7 @@ enum ExploreRunner {
                         mpsScorer2 = nil
                         resolvedTwoStage = false
                         fellBackToSingleStage = true
-                        print("Warning: failed to initialize two-stage MPS (\(error)); falling back to single-stage 128")
+                        emit(.warning, "Warning: failed to initialize two-stage MPS (\(error)); falling back to single-stage 128")
                     } catch {
                         // keep original error handling below
                     }
@@ -115,7 +139,7 @@ enum ExploreRunner {
                 if fellBackToSingleStage {
                     // Keep resolvedBackend as-is (MPS still available).
                 } else if backend == .all {
-                    print("Warning: failed to initialize MPS backend (\(error)); falling back to --backend cpu")
+                    emit(.warning, "Warning: failed to initialize MPS backend (\(error)); falling back to --backend cpu")
                     resolvedBackend = .cpu
                     resolvedTwoStage = false
                 } else {
@@ -127,7 +151,6 @@ enum ExploreRunner {
         let resolvedBackendFinal = resolvedBackend
         let mpsTwoStageFinal = resolvedTwoStage && (resolvedBackendFinal == .mps || resolvedBackendFinal == .all)
 
-        let printLock = NSLock()
         let stats = ExploreStats()
         let best = BestTracker()
         let bestApprox = ApproxBestTracker()
@@ -152,9 +175,7 @@ enum ExploreRunner {
                 do {
                     try saveSeedState(state, to: url)
                 } catch {
-                    printLock.withLock {
-                        print("Warning: failed to write seed state to \(url.path): \(error)")
-                    }
+                    emit(.warning, "Warning: failed to write seed state to \(url.path): \(error)")
                 }
             }
 
@@ -171,10 +192,8 @@ enum ExploreRunner {
             seedAllocator = SeedRangeAllocator(state: state, totalTarget: totalTarget)
 
             let start = V2SeedSpace.min &+ state.startOffset
-            printLock.withLock {
-                print("Seed mode: state file=\(url.path)")
-                print("Seed permutation: start=\(start) step=\(state.step) nextIndex=\(state.nextIndex)")
-            }
+            emit(.info, "Seed mode: state file=\(url.path)")
+            emit(.info, "Seed permutation: start=\(start) step=\(state.step) nextIndex=\(state.nextIndex)")
 
             let interval = max(1.0, stateWriteEverySec)
             let writeQueue = DispatchQueue(label: "gobx.seedstate", qos: .utility)
@@ -215,9 +234,7 @@ enum ExploreRunner {
         var effectiveDoSubmit = doSubmit
         if effectiveDoSubmit {
             if config?.profile == nil {
-                printLock.withLock {
-                    print("Warning: --submit requested but no config/profile found at \(GobxPaths.configURL.path)")
-                }
+                emit(.warning, "Warning: --submit requested but no config/profile found at \(GobxPaths.configURL.path)")
                 effectiveDoSubmit = false
             } else if let cfg = config {
                 let state = SubmissionState()
@@ -225,27 +242,19 @@ enum ExploreRunner {
                     state.mergeTop(top)
                     let snap = state.snapshot()
                     if !minScoreSpecified, snap.top500Threshold.isFinite {
-                        printLock.withLock {
-                            print("Calibrated min-score from \(minScore) to \(snap.top500Threshold) (Rank #\(top.images.count))")
-                        }
+                        emit(.info, "Calibrated min-score from \(minScore) to \(snap.top500Threshold) (Rank #\(top.images.count))")
                         minScore = snap.top500Threshold
                     }
-                    printLock.withLock {
-                        print("Cached \(snap.knownCount) known seeds. Top500 threshold=\(String(format: "%.6f", snap.top500Threshold))")
-                    }
+                    emit(.info, "Cached \(snap.knownCount) known seeds. Top500 threshold=\(String(format: "%.6f", snap.top500Threshold))")
                 } else {
-                    printLock.withLock {
-                        print("Warning: failed to fetch top 500; submissions disabled until refresh succeeds")
-                    }
+                    emit(.warning, "Warning: failed to fetch top 500; submissions may be rejected until refresh succeeds")
                 }
 
                 if let p = cfg.profile {
-                    printLock.withLock {
-                        print("Participating as \(p.name) (\(p.id))")
-                    }
+                    emit(.info, "Participating as \(p.name) (\(p.id))")
                 }
 
-                submission = SubmissionManager(config: cfg, state: state, userMinScore: minScore, printLock: printLock)
+                submission = SubmissionManager(config: cfg, state: state, userMinScore: minScore, printLock: printLock, events: eventLog)
 
                 let interval = max(10.0, refreshEverySec)
                 if interval.isFinite && interval > 0 {
@@ -262,37 +271,29 @@ enum ExploreRunner {
         let mpsCandidateVerifier: CandidateVerifier? = {
             guard effectiveDoSubmit else { return nil }
             guard resolvedBackendFinal == .mps || resolvedBackendFinal == .all else { return nil }
-            return CandidateVerifier(best: best, submission: submission, printLock: printLock)
+            return CandidateVerifier(best: best, submission: submission, printLock: printLock, events: eventLog)
         }()
 
         if effectiveDoSubmit, !mpsMarginSpecified, (resolvedBackendFinal == .mps || resolvedBackendFinal == .all) {
             if let cal = CalibrateMPS.loadIfValid(optLevel: 1) {
                 mpsVerifyMargin = max(0.0, cal.recommendedMargin)
-                printLock.withLock {
-                    print("Loaded MPS calibration: mps-margin=\(String(format: "%.6f", mpsVerifyMargin)) q=\(String(format: "%.4f", cal.quantile)) verified=\(cal.verifiedCount)")
-                }
+                emit(.info, "Loaded MPS calibration: mps-margin=\(String(format: "%.6f", mpsVerifyMargin)) q=\(String(format: "%.4f", cal.quantile)) verified=\(cal.verifiedCount)")
             } else {
-                printLock.withLock {
-                    print("No valid MPS calibration found; run: gobx calibrate-mps (or set --mps-margin explicitly)")
-                }
+                emit(.warning, "No valid MPS calibration found; run: gobx calibrate-mps (or set --mps-margin explicitly)")
             }
         }
 
         if mpsTwoStageFinal, !mpsStage1MarginSpecified {
             if let cal = CalibrateMPSStage1.loadIfValid(optLevel: 1, stage1Size: mpsStage1Size) {
                 mpsStage1Margin = max(0.0, cal.recommendedMargin)
-                printLock.withLock {
-                    print("Loaded MPS stage1 calibration: stage1-margin=\(String(format: "%.6f", mpsStage1Margin)) q=\(String(format: "%.4f", cal.quantile)) verified=\(cal.verifiedCount) size=\(mpsStage1Size)")
-                }
+                emit(.info, "Loaded MPS stage1 calibration: stage1-margin=\(String(format: "%.6f", mpsStage1Margin)) q=\(String(format: "%.4f", cal.quantile)) verified=\(cal.verifiedCount) size=\(mpsStage1Size)")
             } else {
-                printLock.withLock {
-                    print("No valid MPS stage1 calibration found; run: gobx calibrate-mps-stage1 (or set --mps-stage1-margin explicitly)")
-                }
+                emit(.warning, "No valid MPS stage1 calibration found; run: gobx calibrate-mps-stage1 (or set --mps-stage1-margin explicitly)")
             }
         }
 
         var reportTimer: DispatchSourceTimer? = nil
-        if endless {
+        if endless, !uiEnabledFinal, reportEverySec.isFinite, reportEverySec > 0 {
             final class ReportState: @unchecked Sendable {
                 var lastSnap: ExploreStats.Snapshot
                 var lastNs: UInt64
@@ -415,6 +416,30 @@ enum ExploreRunner {
             reportTimer = timer
         }
 
+        var ui: ExploreLiveUI? = nil
+        if uiEnabledFinal, let eventLog {
+            ui = ExploreLiveUI(
+                context: .init(
+                    backend: resolvedBackendFinal,
+                    endless: endless,
+                    totalTarget: totalTarget,
+                    mpsTwoStage: mpsTwoStageFinal,
+                    mpsVerifyMargin: mpsVerifyMargin,
+                    stage1Margin: mpsStage1Margin,
+                    minScore: minScore
+                ),
+                stats: stats,
+                best: best,
+                bestApprox: bestApprox,
+                bestApproxStage1: bestApproxStage1,
+                submission: submission,
+                events: eventLog,
+                refreshEverySec: uiRefreshEverySec
+            )
+            ui?.start()
+        }
+        defer { ui?.stop() }
+
         let group = DispatchGroup()
         let seedAllocatorForWorkers = seedAllocator
         let submissionForWorkers = submission
@@ -440,6 +465,7 @@ enum ExploreRunner {
                     baseSeed: baseSeedForStride,
                     flushIntervalNs: cpuFlushIntervalNs,
                     printLock: printLock,
+                    events: eventLog,
                     stats: stats,
                     best: best,
                     submission: submissionForWorkers,
@@ -477,6 +503,7 @@ enum ExploreRunner {
                     submission: submissionForWorkers,
                     verifier: mpsCandidateVerifier,
                     printLock: printLock,
+                    events: eventLog,
                     stats: stats,
                     bestApprox: bestApprox,
                     bestApproxStage1: bestApproxStage1,
@@ -490,6 +517,8 @@ enum ExploreRunner {
         }
 
         await waitForDispatchGroup(group)
+
+        ui?.stop()
 
         refreshTimer?.cancel()
         reportTimer?.cancel()

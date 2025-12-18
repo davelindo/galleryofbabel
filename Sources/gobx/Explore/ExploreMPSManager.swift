@@ -29,6 +29,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         let verifier: CandidateVerifier?
 
         let printLock: NSLock
+        let events: ExploreEventLog?
         let stats: ExploreStats
         let bestApprox: ApproxBestTracker
         let bestApproxStage1: ApproxBestTracker
@@ -43,6 +44,14 @@ final class ExploreMPSManager: @unchecked Sendable {
 
     init(params: Params) {
         self.p = params
+    }
+
+    private func emit(_ kind: ExploreEventKind, _ message: String) {
+        if let events = p.events {
+            events.append(kind, message)
+        } else {
+            p.printLock.withLock { print(message) }
+        }
     }
 
     func run() {
@@ -114,9 +123,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         }
 
         if p.twoStage, stage2 == nil {
-            p.printLock.lock()
-            print("Warning: two-stage requested but stage2 scorer missing; falling back to single-stage")
-            p.printLock.unlock()
+            emit(.warning, "Warning: two-stage requested but stage2 scorer missing; falling back to single-stage")
         }
 
         runSingleStage(stage1: &stage1, startSeedForLog: startSeedForLog, nextSeed: nextSeed, quota: quota, claimCount: claimCount, useState: useState, stride: stride)
@@ -136,14 +143,12 @@ final class ExploreMPSManager: @unchecked Sendable {
         let seedQueue = SeedQueue()
         let stage2Group = DispatchGroup()
 
-        p.printLock.lock()
         if useState {
-            print("MPS stage1 (\(p.stage1Size)x\(p.stage1Size)) start: \(startSeedForLog) claim=\(claimCount) batch=\(p.mpsBatch) inflight=\(p.mpsInflight) count=\(p.endless ? "∞" : "\(p.total)")")
+            emit(.info, "MPS stage1 (\(p.stage1Size)x\(p.stage1Size)) start: \(startSeedForLog) claim=\(claimCount) batch=\(p.mpsBatch) inflight=\(p.mpsInflight) count=\(p.endless ? "∞" : "\(p.total)")")
         } else {
-            print("MPS stage1 (\(p.stage1Size)x\(p.stage1Size)) start: \(startSeedForLog) stride=\(stride) batch=\(p.mpsBatch) inflight=\(p.mpsInflight) count=\(quota.map(String.init) ?? "∞")")
+            emit(.info, "MPS stage1 (\(p.stage1Size)x\(p.stage1Size)) start: \(startSeedForLog) stride=\(stride) batch=\(p.mpsBatch) inflight=\(p.mpsInflight) count=\(quota.map(String.init) ?? "∞")")
         }
-        print("MPS stage2 (128x128) batch=\(stage2Batch) inflight=\(stage2.inflight)")
-        p.printLock.unlock()
+        emit(.info, "MPS stage2 (128x128) batch=\(stage2Batch) inflight=\(stage2.inflight)")
 
         let stage2Box = UnsafeSendableBox(stage2)
         stage2Group.enter()
@@ -187,6 +192,7 @@ final class ExploreMPSManager: @unchecked Sendable {
             do {
                 try stage2.withCompletedJob(job) { seedsBuf, scoresBuf in
                     var sum = 0.0
+                    var sumSq = 0.0
                     var localBest: Float = -Float.infinity
                     var localBestSeed: UInt64 = 0
 
@@ -199,7 +205,9 @@ final class ExploreMPSManager: @unchecked Sendable {
                             let sc = scoresBuf[idx]
                             guard sc.isFinite else { continue }
                             let s = seedsBuf[idx]
-                            sum += Double(sc)
+                            let d = Double(sc)
+                            sum += d
+                            sumSq += d * d
                             p.topApproxTracker.update(seed: s, score: sc)
                             if sc > localBest {
                                 localBest = sc
@@ -209,7 +217,7 @@ final class ExploreMPSManager: @unchecked Sendable {
                                 candidates.append((seed: s, score: sc))
                             }
                         }
-                        p.stats.addMPS2(count: job.count, scoreSum: sum)
+                        p.stats.addMPS2(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
                         if localBest.isFinite {
                             _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
                         }
@@ -228,22 +236,22 @@ final class ExploreMPSManager: @unchecked Sendable {
                         let sc = scoresBuf[idx]
                         guard sc.isFinite else { continue }
                         let s = seedsBuf[idx]
-                        sum += Double(sc)
+                        let d = Double(sc)
+                        sum += d
+                        sumSq += d * d
                         p.topApproxTracker.update(seed: s, score: sc)
                         if sc > localBest {
                             localBest = sc
                             localBestSeed = s
                         }
                     }
-                    p.stats.addMPS2(count: job.count, scoreSum: sum)
+                    p.stats.addMPS2(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
                     if localBest.isFinite {
                         _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
                     }
                 }
             } catch {
-                p.printLock.lock()
-                print("Warning: MPS stage2 run error: \(error)")
-                p.printLock.unlock()
+                emit(.warning, "Warning: MPS stage2 run error: \(error)")
                 p.stop.requestStop()
                 break
             }
@@ -260,6 +268,7 @@ final class ExploreMPSManager: @unchecked Sendable {
             do {
                 try stage2.withCompletedJob(job) { seedsBuf, scoresBuf in
                     var sum = 0.0
+                    var sumSq = 0.0
                     var localBest: Float = -Float.infinity
                     var localBestSeed: UInt64 = 0
 
@@ -272,7 +281,9 @@ final class ExploreMPSManager: @unchecked Sendable {
                             let sc = scoresBuf[idx]
                             guard sc.isFinite else { continue }
                             let s = seedsBuf[idx]
-                            sum += Double(sc)
+                            let d = Double(sc)
+                            sum += d
+                            sumSq += d * d
                             p.topApproxTracker.update(seed: s, score: sc)
                             if sc > localBest {
                                 localBest = sc
@@ -283,7 +294,7 @@ final class ExploreMPSManager: @unchecked Sendable {
                             }
                         }
 
-                        p.stats.addMPS2(count: job.count, scoreSum: sum)
+                        p.stats.addMPS2(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
                         if localBest.isFinite {
                             _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
                         }
@@ -302,7 +313,9 @@ final class ExploreMPSManager: @unchecked Sendable {
                         let sc = scoresBuf[idx]
                         guard sc.isFinite else { continue }
                         let s = seedsBuf[idx]
-                        sum += Double(sc)
+                        let d = Double(sc)
+                        sum += d
+                        sumSq += d * d
                         p.topApproxTracker.update(seed: s, score: sc)
                         if sc > localBest {
                             localBest = sc
@@ -310,15 +323,13 @@ final class ExploreMPSManager: @unchecked Sendable {
                         }
                     }
 
-                    p.stats.addMPS2(count: job.count, scoreSum: sum)
+                    p.stats.addMPS2(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
                     if localBest.isFinite {
                         _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
                     }
                 }
             } catch {
-                p.printLock.lock()
-                print("Warning: MPS stage2 run error: \(error)")
-                p.printLock.unlock()
+                emit(.warning, "Warning: MPS stage2 run error: \(error)")
                 p.stop.requestStop()
                 break
             }
@@ -352,16 +363,12 @@ final class ExploreMPSManager: @unchecked Sendable {
             let now = DispatchTime.now().uptimeNanoseconds
             if now &- lastReinitNs < p.mpsReinitIntervalNs { return }
 
-            p.printLock.lock()
-            print("Reinitializing MPS scorer…")
-            p.printLock.unlock()
+            emit(.info, "Reinitializing MPS scorer…")
 
             do {
                 stage1 = try MPSScorer(batchSize: batch, imageSize: p.stage1Size, inflight: inflightFinal)
             } catch {
-                p.printLock.lock()
-                print("Warning: MPS reinit failed: \(error)")
-                p.printLock.unlock()
+                emit(.warning, "Warning: MPS reinit failed: \(error)")
                 p.stop.requestStop()
             }
             lastReinitNs = now
@@ -400,6 +407,7 @@ final class ExploreMPSManager: @unchecked Sendable {
             do {
                 try stage1.withCompletedJob(job) { seedsBuf, scoresBuf in
                     var sum = 0.0
+                    var sumSq = 0.0
                     var localBest: Float = -Float.infinity
                     var localBestSeed: UInt64 = 0
 
@@ -411,7 +419,9 @@ final class ExploreMPSManager: @unchecked Sendable {
                         let sc = scoresBuf[idx]
                         guard sc.isFinite else { continue }
                         let s = seedsBuf[idx]
-                        sum += Double(sc)
+                        let d = Double(sc)
+                        sum += d
+                        sumSq += d * d
                         if sc > localBest {
                             localBest = sc
                             localBestSeed = s
@@ -421,15 +431,13 @@ final class ExploreMPSManager: @unchecked Sendable {
                         }
                     }
 
-                    p.stats.addMPS(count: job.count, scoreSum: sum)
+                    p.stats.addMPS(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
                     if localBest.isFinite {
                         _ = p.bestApproxStage1.updateIfBetter(seed: localBestSeed, score: localBest)
                     }
                 }
             } catch {
-                p.printLock.lock()
-                print("Warning: MPS stage1 run error: \(error)")
-                p.printLock.unlock()
+                emit(.warning, "Warning: MPS stage1 run error: \(error)")
                 p.stop.requestStop()
             }
 
@@ -466,13 +474,11 @@ final class ExploreMPSManager: @unchecked Sendable {
         useState: Bool,
         stride: UInt64
     ) {
-        p.printLock.lock()
         if useState {
-            print("MPS start: \(startSeedForLog) claim=\(claimCount) batch=\(p.mpsBatch) inflight=\(stage1.inflight) count=\(p.endless ? "∞" : "\(p.total)")")
+            emit(.info, "MPS start: \(startSeedForLog) claim=\(claimCount) batch=\(p.mpsBatch) inflight=\(stage1.inflight) count=\(p.endless ? "∞" : "\(p.total)")")
         } else {
-            print("MPS start: \(startSeedForLog) stride=\(stride) batch=\(p.mpsBatch) inflight=\(stage1.inflight) count=\(quota.map(String.init) ?? "∞")")
+            emit(.info, "MPS start: \(startSeedForLog) stride=\(stride) batch=\(p.mpsBatch) inflight=\(stage1.inflight) count=\(quota.map(String.init) ?? "∞")")
         }
-        p.printLock.unlock()
 
         let inflightFinal = max(1, p.mpsInflight)
         var pending: [MPSScorer.Job] = []
@@ -493,16 +499,12 @@ final class ExploreMPSManager: @unchecked Sendable {
             let now = DispatchTime.now().uptimeNanoseconds
             if now &- lastReinitNs < p.mpsReinitIntervalNs { return }
 
-            p.printLock.lock()
-            print("Reinitializing MPS scorer…")
-            p.printLock.unlock()
+            emit(.info, "Reinitializing MPS scorer…")
 
             do {
                 stage1 = try MPSScorer(batchSize: max(1, p.mpsBatch), inflight: inflightFinal)
             } catch {
-                p.printLock.lock()
-                print("Warning: MPS reinit failed: \(error)")
-                p.printLock.unlock()
+                emit(.warning, "Warning: MPS reinit failed: \(error)")
                 p.stop.requestStop()
             }
             lastReinitNs = now
@@ -540,6 +542,7 @@ final class ExploreMPSManager: @unchecked Sendable {
             do {
                 try stage1.withCompletedJob(job) { seedsBuf, scoresBuf in
                     var sum = 0.0
+                    var sumSq = 0.0
                     var localBest: Float = -Float.infinity
                     var localBestSeed: UInt64 = 0
 
@@ -553,7 +556,9 @@ final class ExploreMPSManager: @unchecked Sendable {
                             let sc = scoresBuf[idx]
                             guard sc.isFinite else { continue }
                             let s = seedsBuf[idx]
-                            sum += Double(sc)
+                            let d = Double(sc)
+                            sum += d
+                            sumSq += d * d
                             p.topApproxTracker.update(seed: s, score: sc)
                             if sc > localBest {
                                 localBest = sc
@@ -563,7 +568,7 @@ final class ExploreMPSManager: @unchecked Sendable {
                                 candidates.append((seed: s, score: sc))
                             }
                         }
-                        p.stats.addMPS(count: job.count, scoreSum: sum)
+                        p.stats.addMPS(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
                         if localBest.isFinite {
                             _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
                         }
@@ -582,22 +587,22 @@ final class ExploreMPSManager: @unchecked Sendable {
                         let sc = scoresBuf[idx]
                         guard sc.isFinite else { continue }
                         let s = seedsBuf[idx]
-                        sum += Double(sc)
+                        let d = Double(sc)
+                        sum += d
+                        sumSq += d * d
                         p.topApproxTracker.update(seed: s, score: sc)
                         if sc > localBest {
                             localBest = sc
                             localBestSeed = s
                         }
                     }
-                    p.stats.addMPS(count: job.count, scoreSum: sum)
+                    p.stats.addMPS(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
                     if localBest.isFinite {
                         _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
                     }
                 }
             } catch {
-                p.printLock.lock()
-                print("Warning: MPS run error: \(error)")
-                p.printLock.unlock()
+                emit(.warning, "Warning: MPS run error: \(error)")
                 p.stop.requestStop()
             }
             completed += job.count

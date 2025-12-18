@@ -12,16 +12,16 @@ Usage:
   gobx explore --count <n> [--endless] [--start <seed>] [--threads <n>]
               [--batch <n>] [--backend cpu|mps|all] [--top <n>]
               [--submit] [--min-score <x>] [--refresh-every <sec>]
-              [--report-every <sec>] [--mps-margin <x>] [--mps-inflight <n>] [--mps-reinit-every <sec>]
+              [--report-every <sec>] [--ui|--no-ui] [--mps-margin <x>] [--mps-inflight <n>] [--mps-reinit-every <sec>]
               [--mps-two-stage] [--mps-stage1-size <n>] [--mps-stage1-margin <x>] [--mps-stage2-batch <n>]
               [--seed-mode state|stride] [--state <path>] [--state-reset]
               [--state-write-every <sec>] [--claim <n>]
 
 Notes:
   - In endless mode, prints live seeds/s + running avg score (split per backend for `--backend all`).
+  - When stdout is a TTY, `explore` uses an htop-style live UI by default (disable with `--no-ui`).
   - `--backend mps` uses a GPU approximation (peakiness uses geometric mean instead of median).
   - When `--submit` is enabled, MPS candidates are verified with the CPU scorer before submitting.
   - Config/profile is read from `~/.config/gallery-of-babel/config.json`.
   - Set `GOBX_NO_CRASH_REPORTER=1` to disable fatal-signal backtraces.
 """
-

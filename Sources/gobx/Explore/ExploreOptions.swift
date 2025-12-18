@@ -15,6 +15,7 @@ struct ExploreOptions {
     var minScoreSpecified: Bool = false
     var refreshEverySec: Double = 180.0
     var reportEverySec: Double = 1.0
+    var uiEnabled: Bool? = nil
 
     var seedMode: SeedMode = .state
     var statePath: String? = nil
@@ -68,6 +69,10 @@ extension ExploreOptions {
                 o.refreshEverySec = try parser.requireDouble(for: "--refresh-every")
             case "--report-every":
                 o.reportEverySec = try parser.requireDouble(for: "--report-every")
+            case "--ui":
+                o.uiEnabled = true
+            case "--no-ui":
+                o.uiEnabled = false
             case "--seed-mode":
                 o.seedMode = try parser.requireEnum(for: "--seed-mode", SeedMode.self)
             case "--state":
@@ -109,4 +114,3 @@ extension ExploreOptions {
         return o
     }
 }
-

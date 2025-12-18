@@ -12,6 +12,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
         let baseSeed: UInt64
         let flushIntervalNs: UInt64
         let printLock: NSLock
+        let events: ExploreEventLog?
         let stats: ExploreStats
         let best: BestTracker
         let submission: SubmissionManager?
@@ -59,27 +60,31 @@ final class ExploreCPUWorker: @unchecked Sendable {
 
             let source = p.resolvedBackend == .all ? "cpu" : nil
 
-            p.printLock.lock()
-            if p.resolvedBackend == .all {
-                if useState {
-                    print("CPU thread \(tid) start: \(seed) claim=\(p.claimSize) count=\(p.endless ? "∞" : "\(p.total)")")
-                } else {
-                    print("CPU thread \(tid) start: \(seed) stride=\(stride) count=\(quota.map(String.init) ?? "∞")")
+            let startMsg: String = {
+                if p.resolvedBackend == .all {
+                    if useState {
+                        return "CPU thread \(tid) start: \(seed) claim=\(p.claimSize) count=\(p.endless ? "∞" : "\(p.total)")"
+                    }
+                    return "CPU thread \(tid) start: \(seed) stride=\(stride) count=\(quota.map(String.init) ?? "∞")"
                 }
+                if useState {
+                    return "Thread \(tid) start: \(seed) claim=\(p.claimSize) count=\(p.endless ? "∞" : "\(p.total)")"
+                }
+                let cpuStride = UInt64(max(1, p.threadCount))
+                return "Thread \(tid) start: \(seed) stride=\(cpuStride) count=\(quota.map(String.init) ?? "∞")"
+            }()
+
+            if let events = p.events {
+                events.append(.info, startMsg)
             } else {
-                if useState {
-                    print("Thread \(tid) start: \(seed) claim=\(p.claimSize) count=\(p.endless ? "∞" : "\(p.total)")")
-                } else {
-                    let cpuStride = UInt64(max(1, p.threadCount))
-                    print("Thread \(tid) start: \(seed) stride=\(cpuStride) count=\(quota.map(String.init) ?? "∞")")
-                }
+                p.printLock.withLock { print(startMsg) }
             }
-            p.printLock.unlock()
 
             var localBest = -Double.infinity
             var processed = 0
             var flushCount = 0
             var flushSum = 0.0
+            var flushSumSq = 0.0
             let flushEvery = 512
             var lastFlushNs = DispatchTime.now().uptimeNanoseconds
             var flushCheck = 0
@@ -107,6 +112,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
                 processed += 1
                 flushCount += 1
                 flushSum += score
+                flushSumSq += score * score
 
                 if score > localBest {
                     localBest = score
@@ -118,18 +124,20 @@ final class ExploreCPUWorker: @unchecked Sendable {
                 }
 
                 if flushCount >= flushEvery {
-                    p.stats.addCPU(count: flushCount, scoreSum: flushSum)
+                    p.stats.addCPU(count: flushCount, scoreSum: flushSum, scoreSumSq: flushSumSq)
                     flushCount = 0
                     flushSum = 0
+                    flushSumSq = 0
                     lastFlushNs = DispatchTime.now().uptimeNanoseconds
                 } else if p.flushIntervalNs > 0 {
                     flushCheck = (flushCheck + 1) & 31
                     if flushCheck == 0 {
                         let now = DispatchTime.now().uptimeNanoseconds
                         if now &- lastFlushNs >= p.flushIntervalNs, flushCount > 0 {
-                            p.stats.addCPU(count: flushCount, scoreSum: flushSum)
+                            p.stats.addCPU(count: flushCount, scoreSum: flushSum, scoreSumSq: flushSumSq)
                             flushCount = 0
                             flushSum = 0
+                            flushSumSq = 0
                             lastFlushNs = now
                         }
                     }
@@ -142,7 +150,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
             }
 
             if flushCount > 0 {
-                p.stats.addCPU(count: flushCount, scoreSum: flushSum)
+                p.stats.addCPU(count: flushCount, scoreSum: flushSum, scoreSumSq: flushSumSq)
             }
         }
     }
@@ -150,8 +158,11 @@ final class ExploreCPUWorker: @unchecked Sendable {
     private func maybePrintNewBest(seed: UInt64, score: Double, source: String?) {
         guard p.best.updateIfBetter(seed: seed, score: score, source: source) else { return }
         let tag = source.map { " (\($0))" } ?? ""
-        p.printLock.lock()
-        print("New best score: \(String(format: "%.6f", score)) seed: \(seed)\(tag)")
-        p.printLock.unlock()
+        let msg = "New best score: \(String(format: "%.6f", score)) seed: \(seed)\(tag)"
+        if let events = p.events {
+            events.append(.best, msg)
+        } else {
+            p.printLock.withLock { print(msg) }
+        }
     }
 }
