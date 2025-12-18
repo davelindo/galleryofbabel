@@ -15,6 +15,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Xcode (Swift 6)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Swift version
+        run: swift --version
+
       - name: Build (release)
         run: make build-release
 
@@ -27,4 +35,3 @@ jobs:
           name: gobx-macos-${{ runner.arch }}
           path: ./.build/release/gobx
           if-no-files-found: error
-
