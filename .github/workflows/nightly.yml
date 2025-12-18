@@ -1,0 +1,64 @@
+name: Nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-main
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build (release)
+        run: make build-release
+
+      - name: Selftest (CPU)
+        run: ./.build/release/gobx selftest
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          mkdir -p dist
+          cp .build/release/gobx dist/
+          tar -czf "gobx-macos-${arch}.tar.gz" -C dist gobx
+          shasum -a 256 "gobx-macos-${arch}.tar.gz" > "gobx-macos-${arch}.tar.gz.sha256"
+
+      - name: Update nightly tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly
+          git push -f origin nightly
+
+      - name: Publish nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          built="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          notes=$'Built from `main` @ '"${GITHUB_SHA}"$'\n\n'"- Built: ${built}"$'\n- Runner: '"${RUNNER_OS} ${RUNNER_ARCH}"$'\n'
+
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --title "Nightly" --notes "${notes}"
+          else
+            gh release create nightly --title "Nightly" --notes "${notes}" --prerelease
+          fi
+
+          gh release upload nightly "gobx-macos-${arch}.tar.gz" "gobx-macos-${arch}.tar.gz.sha256" --clobber
+

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (release)
+        run: make build-release
+
+      - name: Selftest (CPU)
+        run: ./.build/release/gobx selftest
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gobx-macos-${{ runner.arch }}
+          path: ./.build/release/gobx
+          if-no-files-found: error
+
