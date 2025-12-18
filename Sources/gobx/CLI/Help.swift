@@ -6,7 +6,7 @@ gobx - native high-performance scorer for Gallery of Babel (macOS/Accelerate)
 Usage:
   gobx score <seed> [--backend cpu|mps] [--batch <n>] [--json]
   gobx selftest [--golden <path>] [--write-golden] [--count <n>] [--limit <n>] [--tolerance <x>]
-  gobx bench-mps [--seconds <s>] [--warmup <s>] [--warmup-batches <n>] [--reps <n>] [--batches <csv>] [--inflight <n>] [--opt 0|1] [--log-dir <path>] [--json]
+  gobx bench-mps [--seconds <s>] [--warmup <s>] [--warmup-batches <n>] [--reps <n>] [--batches <csv>] [--size <n>] [--gpu-util] [--gpu-interval-ms <n>] [--inflight <n>] [--opt 0|1] [--log-dir <path>] [--json]
   gobx calibrate-mps [--batch <n>] [--scan <n>] [--top <n>] [--quantile <q>] [--opt 0|1] [--out <path>] [--force]
   gobx calibrate-mps-stage1 [--stage1-size <n>] [--batch <n>] [--scan <n>] [--top <n>] [--quantile <q>] [--opt 0|1] [--out <path>] [--force]
   gobx explore --count <n> [--endless] [--start <seed>] [--threads <n>]

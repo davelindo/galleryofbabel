@@ -8,6 +8,7 @@ final class ExploreLiveUI: @unchecked Sendable {
         let endless: Bool
         let totalTarget: Int?
         let mpsTwoStage: Bool
+        let mpsStage1Size: Int
         let mpsVerifyMargin: Double
         let stage1Margin: Double
         let minScore: Double
@@ -92,12 +93,15 @@ final class ExploreLiveUI: @unchecked Sendable {
         let snap = stats.snapshot()
 
         let cpuDelta = Double(snap.cpuCount &- lastSnap.cpuCount)
+        let cpuVerifyDelta = Double(snap.cpuVerifyCount &- lastSnap.cpuVerifyCount)
         let mpsDelta = Double(snap.mpsCount &- lastSnap.mpsCount)
         let mps2Delta = Double(snap.mps2Count &- lastSnap.mps2Count)
         let cpuRate = dt > 0 ? cpuDelta / dt : 0
+        let cpuVerifyRate = dt > 0 ? cpuVerifyDelta / dt : 0
         let mpsRate = dt > 0 ? mpsDelta / dt : 0
         let mps2Rate = dt > 0 ? mps2Delta / dt : 0
-        let totalDelta = cpuDelta + mpsDelta
+        let progressDelta = cpuDelta + mpsDelta
+        let totalDelta = progressDelta + cpuVerifyDelta
         let totalRate = dt > 0 ? totalDelta / dt : 0
 
         lastSnap = snap
@@ -132,11 +136,12 @@ final class ExploreLiveUI: @unchecked Sendable {
         let bestApprox1Str: String? = {
             guard ctx.mpsTwoStage else { return nil }
             guard approx1Snap.score.isFinite else { return nil }
-            return "≈\(String(format: "%.6f", Double(approx1Snap.score))) (\(approx1Snap.seed),mps64)"
+            return "≈\(String(format: "%.6f", Double(approx1Snap.score))) (\(approx1Snap.seed),mps\(ctx.mpsStage1Size))"
         }()
         let bestStr = bestExactStr ?? bestApproxStr ?? bestApprox1Str ?? "?"
 
         let cpuMeanStd = meanStd(count: snap.cpuCount, sum: snap.cpuScoreSum, sumSq: snap.cpuScoreSumSq)
+        let cpuVerifyMeanStd = meanStd(count: snap.cpuVerifyCount, sum: snap.cpuVerifyScoreSum, sumSq: snap.cpuVerifyScoreSumSq)
         let mpsMeanStd = meanStd(count: snap.mpsCount, sum: snap.mpsScoreSum, sumSq: snap.mpsScoreSumSq)
         let mps2MeanStd = meanStd(count: snap.mps2Count, sum: snap.mps2ScoreSum, sumSq: snap.mps2ScoreSumSq)
 
@@ -184,16 +189,22 @@ final class ExploreLiveUI: @unchecked Sendable {
                 let mean1 = mpsMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
                 let mean2 = mps2MeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
                 let eta2 = mps2Eta.map { "ETA(gate)≈\($0)" } ?? "ETA(gate)=?"
-                lines.append(truncateANSI("\(ANSI.magenta)MPS64\(ANSI.reset) \(fmtCount(snap.mpsCount))  \(fmtRate(mpsRate))/s  \(mean1)", cols: size.cols))
+                let s1 = max(1, ctx.mpsStage1Size)
+                lines.append(truncateANSI("\(ANSI.magenta)MPS\(s1)\(ANSI.reset) \(fmtCount(snap.mpsCount))  \(fmtRate(mpsRate))/s  \(mean1)", cols: size.cols))
                 lines.append(truncateANSI("\(ANSI.magenta)MPS128\(ANSI.reset) \(fmtCount(snap.mps2Count))  \(fmtRate(mps2Rate))/s  \(mean2)  \(eta2)", cols: size.cols))
             } else {
                 let meanStr = mpsMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
                 let etaStr = mpsEta.map { "ETA(gate)≈\($0)" } ?? "ETA(gate)=?"
                 lines.append(truncateANSI("\(ANSI.magenta)MPS\(ANSI.reset)  \(fmtCount(snap.mpsCount))  \(fmtRate(mpsRate))/s  \(meanStr)  \(etaStr)", cols: size.cols))
             }
+            if snap.cpuVerifyCount > 0 {
+                let meanVerify = cpuVerifyMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
+                lines.append(truncateANSI("\(ANSI.green)CPUv\(ANSI.reset)  \(fmtCount(snap.cpuVerifyCount))  \(fmtRate(cpuVerifyRate))/s  \(meanVerify)", cols: size.cols))
+            }
         }
 
-        let totalCount = snap.cpuCount &+ snap.mpsCount
+        let progressCount = snap.cpuCount &+ snap.mpsCount
+        let totalCount = progressCount &+ snap.cpuVerifyCount
         lines.append(truncateANSI("\(ANSI.cyan)TOTAL\(ANSI.reset) \(fmtCount(totalCount))  \(fmtRate(totalRate))/s  best=\(bestStr)", cols: size.cols))
 
         let sparkWidth = max(10, min(size.cols - 18, 60))
@@ -202,7 +213,7 @@ final class ExploreLiveUI: @unchecked Sendable {
         lines.append(truncateANSI(sparkLine, cols: size.cols))
 
         if !ctx.endless, let totalTarget = ctx.totalTarget {
-            let pct = totalTarget > 0 ? min(1.0, Double(totalCount) / Double(totalTarget)) : 0.0
+            let pct = totalTarget > 0 ? min(1.0, Double(progressCount) / Double(totalTarget)) : 0.0
             lines.append(truncateANSI("\(ANSI.gray)progress \(String(format: "%.1f", pct * 100))%  target=\(fmtCount(UInt64(totalTarget)))\(ANSI.reset)", cols: size.cols))
         }
 

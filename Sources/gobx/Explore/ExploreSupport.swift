@@ -6,6 +6,9 @@ final class ExploreStats: @unchecked Sendable {
         let cpuCount: UInt64
         let cpuScoreSum: Double
         let cpuScoreSumSq: Double
+        let cpuVerifyCount: UInt64
+        let cpuVerifyScoreSum: Double
+        let cpuVerifyScoreSumSq: Double
         let mpsCount: UInt64
         let mpsScoreSum: Double
         let mpsScoreSumSq: Double
@@ -18,6 +21,9 @@ final class ExploreStats: @unchecked Sendable {
     private var cpuCount: UInt64 = 0
     private var cpuScoreSum: Double = 0
     private var cpuScoreSumSq: Double = 0
+    private var cpuVerifyCount: UInt64 = 0
+    private var cpuVerifyScoreSum: Double = 0
+    private var cpuVerifyScoreSumSq: Double = 0
     private var mpsCount: UInt64 = 0
     private var mpsScoreSum: Double = 0
     private var mpsScoreSumSq: Double = 0
@@ -31,6 +37,15 @@ final class ExploreStats: @unchecked Sendable {
         cpuCount &+= UInt64(count)
         cpuScoreSum += scoreSum
         cpuScoreSumSq += scoreSumSq
+        lock.unlock()
+    }
+
+    func addCPUVerify(count: Int, scoreSum: Double, scoreSumSq: Double) {
+        guard count > 0 else { return }
+        lock.lock()
+        cpuVerifyCount &+= UInt64(count)
+        cpuVerifyScoreSum += scoreSum
+        cpuVerifyScoreSumSq += scoreSumSq
         lock.unlock()
     }
 
@@ -58,6 +73,9 @@ final class ExploreStats: @unchecked Sendable {
             cpuCount: cpuCount,
             cpuScoreSum: cpuScoreSum,
             cpuScoreSumSq: cpuScoreSumSq,
+            cpuVerifyCount: cpuVerifyCount,
+            cpuVerifyScoreSum: cpuVerifyScoreSum,
+            cpuVerifyScoreSumSq: cpuVerifyScoreSumSq,
             mpsCount: mpsCount,
             mpsScoreSum: mpsScoreSum,
             mpsScoreSumSq: mpsScoreSumSq,
@@ -297,6 +315,7 @@ final class CandidateVerifier: @unchecked Sendable {
     private let submission: SubmissionManager?
     private let printLock: NSLock
     private let events: ExploreEventLog?
+    private let stats: ExploreStats
     private let queue = DispatchQueue(label: "gobx.verify", qos: .utility)
     private let pending = DispatchGroup()
     private let seenLock = NSLock()
@@ -306,11 +325,12 @@ final class CandidateVerifier: @unchecked Sendable {
     private let maxPending: Int
     private let scorer: Scorer
 
-    init(best: BestTracker, submission: SubmissionManager?, printLock: NSLock, events: ExploreEventLog?, maxPending: Int = 512) {
+    init(best: BestTracker, submission: SubmissionManager?, printLock: NSLock, events: ExploreEventLog?, stats: ExploreStats, maxPending: Int = 512) {
         self.best = best
         self.submission = submission
         self.printLock = printLock
         self.events = events
+        self.stats = stats
         self.maxPending = max(1, maxPending)
         self.scorer = Scorer(size: 128)
     }
@@ -344,6 +364,7 @@ final class CandidateVerifier: @unchecked Sendable {
                 self.pendingLock.unlock()
             }
             let exact = self.scorer.score(seed: seed).totalScore
+            self.stats.addCPUVerify(count: 1, scoreSum: exact, scoreSumSq: exact * exact)
 
             if self.best.updateIfBetter(seed: seed, score: exact, source: source) {
                 let tag = " (\(source))"

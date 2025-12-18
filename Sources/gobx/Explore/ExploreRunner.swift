@@ -271,7 +271,7 @@ enum ExploreRunner {
         let mpsCandidateVerifier: CandidateVerifier? = {
             guard effectiveDoSubmit else { return nil }
             guard resolvedBackendFinal == .mps || resolvedBackendFinal == .all else { return nil }
-            return CandidateVerifier(best: best, submission: submission, printLock: printLock, events: eventLog)
+            return CandidateVerifier(best: best, submission: submission, printLock: printLock, events: eventLog, stats: stats)
         }()
 
         if effectiveDoSubmit, !mpsMarginSpecified, (resolvedBackendFinal == .mps || resolvedBackendFinal == .all) {
@@ -317,19 +317,22 @@ enum ExploreRunner {
                 guard dt > 0 else { return }
 
                 let cpuDelta = Double(snap.cpuCount &- state.lastSnap.cpuCount)
+                let cpuVerifyDelta = Double(snap.cpuVerifyCount &- state.lastSnap.cpuVerifyCount)
                 let mpsDelta = Double(snap.mpsCount &- state.lastSnap.mpsCount)
                 let mps2Delta = Double(snap.mps2Count &- state.lastSnap.mps2Count)
                 let cpuRate = cpuDelta / dt
+                let cpuVerifyRate = cpuVerifyDelta / dt
                 let mpsRate = mpsDelta / dt
                 let mps2Rate = mps2Delta / dt
 
                 let cpuAvg = snap.cpuCount > 0 ? snap.cpuScoreSum / Double(snap.cpuCount) : 0.0
+                let cpuVerifyAvg = snap.cpuVerifyCount > 0 ? snap.cpuVerifyScoreSum / Double(snap.cpuVerifyCount) : 0.0
                 let mpsAvg = snap.mpsCount > 0 ? snap.mpsScoreSum / Double(snap.mpsCount) : 0.0
                 let mps2Avg = snap.mps2Count > 0 ? snap.mps2ScoreSum / Double(snap.mps2Count) : 0.0
 
-                let totalCount = snap.cpuCount &+ snap.mpsCount
-                let totalSum = snap.cpuScoreSum + snap.mpsScoreSum
-                let totalDelta = Double(totalCount &- (state.lastSnap.cpuCount &+ state.lastSnap.mpsCount))
+                let totalCount = snap.cpuCount &+ snap.mpsCount &+ snap.cpuVerifyCount
+                let totalSum = snap.cpuScoreSum + snap.mpsScoreSum + snap.cpuVerifyScoreSum
+                let totalDelta = Double(totalCount &- (state.lastSnap.cpuCount &+ state.lastSnap.mpsCount &+ state.lastSnap.cpuVerifyCount))
                 let totalRate = totalDelta / dt
                 let totalAvg = totalCount > 0 ? totalSum / Double(totalCount) : 0.0
 
@@ -350,15 +353,16 @@ enum ExploreRunner {
                 let bestApprox1Str: String? = {
                     guard mpsTwoStageFinal else { return nil }
                     guard approx1Snap.score.isFinite else { return nil }
-                    return "≈\(String(format: "%.6f", Double(approx1Snap.score))) (\(approx1Snap.seed),mps64)"
+                    return "≈\(String(format: "%.6f", Double(approx1Snap.score))) (\(approx1Snap.seed),mps\(mpsStage1Size))"
                 }()
                 let bestStr = bestExactStr ?? bestApproxStr ?? bestApprox1Str ?? "?"
                 var bestApproxSuffix = ""
+                let bestApprox1Key = "best≈\(mpsStage1Size)"
                 if bestExactStr != nil {
                     if let s = bestApproxStr { bestApproxSuffix += " best≈=\(s)" }
-                    if let s = bestApprox1Str { bestApproxSuffix += " best≈64=\(s)" }
+                    if let s = bestApprox1Str { bestApproxSuffix += " \(bestApprox1Key)=\(s)" }
                 } else if bestApproxStr != nil, let s = bestApprox1Str {
-                    bestApproxSuffix = " best≈64=\(s)"
+                    bestApproxSuffix = " \(bestApprox1Key)=\(s)"
                 }
 
                 var thrSuffix = ""
@@ -369,24 +373,30 @@ enum ExploreRunner {
                     thrSuffix = " thr=\(thrStr) top500=\(topThrStr)"
                 }
 
+                let cpuVerifySuffix: String = {
+                    guard snap.cpuVerifyCount > 0 else { return "" }
+                    return String(format: " cpuv=%llu (%.0f/s avg=%.6f)", snap.cpuVerifyCount, cpuVerifyRate, cpuVerifyAvg)
+                }()
+
                 printLock.withLock {
                     switch resolvedBackendFinal {
                     case .all:
                         if mpsTwoStageFinal {
-                            let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f) mps64=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)",
+                            let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f) mps%d=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)",
                                               elapsed,
                                               snap.cpuCount, cpuRate, cpuAvg,
+                                              mpsStage1Size,
                                               snap.mpsCount, mpsRate, mpsAvg,
                                               snap.mps2Count, mps2Rate, mps2Avg,
                                               totalCount, totalRate, totalAvg)
-                            print("\(base) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
+                            print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
                         } else {
                             let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)",
                                               elapsed,
                                               snap.cpuCount, cpuRate, cpuAvg,
                                               snap.mpsCount, mpsRate, mpsAvg,
                                               totalCount, totalRate, totalAvg)
-                            print("\(base) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
+                            print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
                         }
                     case .cpu:
                         let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f)",
@@ -395,16 +405,17 @@ enum ExploreRunner {
                         print("\(base) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
                     case .mps:
                         if mpsTwoStageFinal {
-                            let base = String(format: "t=%.1fs mps64=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f)",
+                            let base = String(format: "t=%.1fs mps%d=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f)",
                                               elapsed,
+                                              mpsStage1Size,
                                               snap.mpsCount, mpsRate, mpsAvg,
                                               snap.mps2Count, mps2Rate, mps2Avg)
-                            print("\(base) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
+                            print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
                         } else {
                             let base = String(format: "t=%.1fs mps=%llu (%.0f/s avg=%.6f)",
                                               elapsed,
                                               snap.mpsCount, mpsRate, mpsAvg)
-                            print("\(base) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
+                            print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
                         }
                     }
                 }
@@ -424,6 +435,7 @@ enum ExploreRunner {
                     endless: endless,
                     totalTarget: totalTarget,
                     mpsTwoStage: mpsTwoStageFinal,
+                    mpsStage1Size: mpsStage1Size,
                     mpsVerifyMargin: mpsVerifyMargin,
                     stage1Margin: mpsStage1Margin,
                     minScore: minScore
@@ -548,14 +560,16 @@ enum ExploreRunner {
         let dt = Double(endNs - startNs) / 1e9
         let snap = stats.snapshot()
         let cpuRate = Double(snap.cpuCount) / max(1e-9, dt)
+        let cpuVerifyRate = Double(snap.cpuVerifyCount) / max(1e-9, dt)
         let mpsRate = Double(snap.mpsCount) / max(1e-9, dt)
         let mps2Rate = Double(snap.mps2Count) / max(1e-9, dt)
-        let totalCount = snap.cpuCount &+ snap.mpsCount
+        let totalCount = snap.cpuCount &+ snap.mpsCount &+ snap.cpuVerifyCount
         let totalRate = Double(totalCount) / max(1e-9, dt)
         let cpuAvg = snap.cpuCount > 0 ? snap.cpuScoreSum / Double(snap.cpuCount) : 0.0
+        let cpuVerifyAvg = snap.cpuVerifyCount > 0 ? snap.cpuVerifyScoreSum / Double(snap.cpuVerifyCount) : 0.0
         let mpsAvg = snap.mpsCount > 0 ? snap.mpsScoreSum / Double(snap.mpsCount) : 0.0
         let mps2Avg = snap.mps2Count > 0 ? snap.mps2ScoreSum / Double(snap.mps2Count) : 0.0
-        let totalAvg = totalCount > 0 ? (snap.cpuScoreSum + snap.mpsScoreSum) / Double(totalCount) : 0.0
+        let totalAvg = totalCount > 0 ? (snap.cpuScoreSum + snap.mpsScoreSum + snap.cpuVerifyScoreSum) / Double(totalCount) : 0.0
         let bestSnap = best.snapshot()
         let approxSnap = bestApprox.snapshot()
         let approx1Snap = bestApproxStage1.snapshot()
@@ -569,27 +583,35 @@ enum ExploreRunner {
                 return (approxSnap.seed, Double(approxSnap.score), tag)
             }
             if mpsTwoStageFinal, approx1Snap.score.isFinite, resolvedBackendFinal != .cpu {
-                return (approx1Snap.seed, Double(approx1Snap.score), " (mps64≈)")
+                return (approx1Snap.seed, Double(approx1Snap.score), " (mps\(mpsStage1Size)≈)")
             }
             return (0, -Double.infinity, "")
+        }()
+
+        let cpuVerifySuffix: String = {
+            guard snap.cpuVerifyCount > 0 else { return "" }
+            return String(format: " cpuv=%llu (%.0f/s avg=%.6f)", snap.cpuVerifyCount, cpuVerifyRate, cpuVerifyAvg)
         }()
 
         printLock.withLock {
             if resolvedBackendFinal == .all {
                 if mpsTwoStageFinal {
-                    print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps64=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f) best=%.6f (%llu)%@",
+                    print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps%d=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
                                  dt,
                                  snap.cpuCount, cpuRate, cpuAvg,
+                                 mpsStage1Size,
                                  snap.mpsCount, mpsRate, mpsAvg,
                                  snap.mps2Count, mps2Rate, mps2Avg,
                                  totalCount, totalRate, totalAvg,
+                                 cpuVerifySuffix,
                                  bestFinal.score, bestFinal.seed, bestFinal.tag))
                 } else {
-                    print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f) best=%.6f (%llu)%@",
+                    print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
                                  dt,
                                  snap.cpuCount, cpuRate, cpuAvg,
                                  snap.mpsCount, mpsRate, mpsAvg,
                                  totalCount, totalRate, totalAvg,
+                                 cpuVerifySuffix,
                                  bestFinal.score, bestFinal.seed, bestFinal.tag))
                 }
             } else if resolvedBackendFinal == .cpu {
@@ -599,15 +621,18 @@ enum ExploreRunner {
                              bestFinal.score, bestFinal.seed, bestFinal.tag))
             } else {
                 if mpsTwoStageFinal {
-                    print(String(format: "elapsed=%.2fs mps64=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f) best=%.6f (%llu)%@",
+                    print(String(format: "elapsed=%.2fs mps%d=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
                                  dt,
+                                 mpsStage1Size,
                                  snap.mpsCount, mpsRate, mpsAvg,
                                  snap.mps2Count, mps2Rate, mps2Avg,
+                                 cpuVerifySuffix,
                                  bestFinal.score, bestFinal.seed, bestFinal.tag))
                 } else {
-                    print(String(format: "elapsed=%.2fs mps=%llu (%.0f/s avg=%.6f) best=%.6f (%llu)%@",
+                    print(String(format: "elapsed=%.2fs mps=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
                                  dt,
                                  snap.mpsCount, mpsRate, mpsAvg,
+                                 cpuVerifySuffix,
                                  bestFinal.score, bestFinal.seed, bestFinal.tag))
                 }
             }

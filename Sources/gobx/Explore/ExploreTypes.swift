@@ -44,29 +44,28 @@ final class TopApproxTracker: @unchecked Sendable {
 }
 
 final class SeedQueue: @unchecked Sendable {
-    private let lock = NSLock()
+    private let cond = NSCondition()
     private var buf: [UInt64] = []
     private var head: Int = 0
     private var closed = false
-    private let available = DispatchSemaphore(value: 0)
 
     func pushMany(_ seeds: [UInt64]) {
         guard !seeds.isEmpty else { return }
-        lock.lock()
+        cond.lock()
         if closed {
-            lock.unlock()
+            cond.unlock()
             return
         }
         buf.append(contentsOf: seeds)
-        lock.unlock()
-        for _ in seeds { available.signal() }
+        cond.broadcast()
+        cond.unlock()
     }
 
     func close() {
-        lock.lock()
+        cond.lock()
         closed = true
-        lock.unlock()
-        available.signal()
+        cond.broadcast()
+        cond.unlock()
     }
 
     // Returns:
@@ -75,30 +74,38 @@ final class SeedQueue: @unchecked Sendable {
     // - [seeds] with 1..max items
     func popBatch(max: Int, timeout: DispatchTime) -> [UInt64]? {
         precondition(max > 0)
-        if available.wait(timeout: timeout) == .timedOut {
-            return []
-        }
+        cond.lock()
+        while true {
+            let availableCount = buf.count - head
+            if availableCount > 0 {
+                let take = min(max, availableCount)
+                let out = Array(buf[head..<(head + take)])
+                head += take
+                if head >= 4096 && head * 2 >= buf.count {
+                    buf.removeFirst(head)
+                    head = 0
+                }
+                cond.unlock()
+                return out
+            }
 
-        lock.lock()
-        let availableCount = buf.count - head
-        if availableCount <= 0 {
-            let done = closed
-            lock.unlock()
-            return done ? nil : []
-        }
-        let take = min(max, availableCount)
-        let out = Array(buf[head..<(head + take)])
-        head += take
-        if head >= 4096 && head * 2 >= buf.count {
-            buf.removeFirst(head)
-            head = 0
-        }
-        lock.unlock()
+            if closed {
+                cond.unlock()
+                return nil
+            }
 
-        if take > 1 {
-            for _ in 1..<take { _ = available.wait(timeout: .now()) }
+            let nowNs = DispatchTime.now().uptimeNanoseconds
+            let deadlineNs = timeout.uptimeNanoseconds
+            if deadlineNs <= nowNs {
+                cond.unlock()
+                return []
+            }
+            let dt = Double(deadlineNs - nowNs) / 1e9
+            let deadline = Date(timeIntervalSinceNow: dt)
+            if !cond.wait(until: deadline) {
+                cond.unlock()
+                return []
+            }
         }
-        return out
     }
 }
-
