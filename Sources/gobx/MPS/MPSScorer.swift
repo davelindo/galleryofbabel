@@ -42,6 +42,10 @@ enum MPSScorerError: Error, CustomStringConvertible {
 final class MPSScorer {
     static let scorerVersion: Int = 1
 
+    static func isMetalAvailable() -> Bool {
+        return MTLCreateSystemDefaultDevice() != nil
+    }
+
     struct Job {
         let slotIndex: Int
         let count: Int

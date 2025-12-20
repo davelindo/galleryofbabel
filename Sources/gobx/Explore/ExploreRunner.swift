@@ -8,20 +8,28 @@ enum ExploreRunner {
         let startSeed = options.startSeed
         let threads = options.threads
         let batch = options.batch
-        let backend = options.backend
+        var backend = options.backend
+        let backendSpecified = options.backendSpecified
         let topNArg = options.topN
-        let doSubmit = options.doSubmit
+        var doSubmit = options.doSubmit
+        let doSubmitSpecified = options.doSubmitSpecified
         var minScore = options.minScore
         let minScoreSpecified = options.minScoreSpecified
+        var topUniqueUsers = options.topUniqueUsers
+        let topUniqueUsersSpecified = options.topUniqueUsersSpecified
         var mpsVerifyMargin = options.mpsVerifyMargin
         let mpsMarginSpecified = options.mpsMarginSpecified
+        var mpsMarginAuto = options.mpsMarginAuto
+        let mpsMarginAutoSpecified = options.mpsMarginAutoSpecified
         let mpsInflight = options.mpsInflight
         let mpsReinitEverySec = options.mpsReinitEverySec
-        let mpsTwoStage = options.mpsTwoStage
-        let mpsStage1Size = options.mpsStage1Size
-        var mpsStage1Margin = options.mpsStage1Margin
-        let mpsStage1MarginSpecified = options.mpsStage1MarginSpecified
-        let mpsStage2Batch = options.mpsStage2Batch
+        var mpsBatchAuto = options.mpsBatchAuto
+        let mpsBatchAutoSpecified = options.mpsBatchAutoSpecified
+        var mpsBatchMin = options.mpsBatchMin
+        var mpsBatchMax = options.mpsBatchMax
+        let mpsBatchMinSpecified = options.mpsBatchMinSpecified
+        let mpsBatchMaxSpecified = options.mpsBatchMaxSpecified
+        let mpsBatchTuneEverySec = options.mpsBatchTuneEverySec
         let refreshEverySec = options.refreshEverySec
         let reportEverySec = options.reportEverySec
         let seedMode = options.seedMode
@@ -30,6 +38,11 @@ enum ExploreRunner {
         let stateWriteEverySec = options.stateWriteEverySec
         let claimSize = options.claimSize
         let uiEnabledArg = options.uiEnabled
+        let memGuardMaxGB = options.memGuardMaxGB
+        let memGuardMaxFrac = options.memGuardMaxFrac
+        let memGuardMaxGBSpecified = options.memGuardMaxGBSpecified
+        let memGuardMaxFracSpecified = options.memGuardMaxFracSpecified
+        let memGuardEverySec = options.memGuardEverySec
 
         let printLock = NSLock()
 
@@ -63,13 +76,52 @@ enum ExploreRunner {
             }
         }
 
+        func waitForDispatchGroup(_ group: DispatchGroup) async {
+            await withCheckedContinuation { cont in
+                group.notify(queue: DispatchQueue.global(qos: .utility)) {
+                    cont.resume()
+                }
+            }
+        }
+
         let cpuFlushIntervalNs: UInt64 = {
             guard endless else { return 0 }
             let sec = min(1.0, max(0.25, uiRefreshEverySec / 2.0))
             return UInt64(sec * 1e9)
         }()
 
+        let metalAvailable = MPSScorer.isMetalAvailable()
+        if !backendSpecified {
+            backend = metalAvailable ? .mps : .cpu
+        }
+        if !doSubmitSpecified {
+            doSubmit = true
+        }
+        if !topUniqueUsersSpecified {
+            topUniqueUsers = true
+        }
+        if !mpsBatchAutoSpecified, backend == .mps || backend == .all {
+            mpsBatchAuto = true
+        }
+        if !mpsMarginAutoSpecified, backend == .mps || backend == .all {
+            mpsMarginAuto = true
+        }
+
         let mpsBatch = max(1, batch)
+        if mpsBatchAuto {
+            if !mpsBatchMinSpecified {
+                mpsBatchMin = max(1, mpsBatch / 2)
+            }
+            if !mpsBatchMaxSpecified {
+                mpsBatchMax = max(mpsBatch, 12288)
+            }
+            if mpsBatchMax < mpsBatchMin {
+                throw GobxError.usage("--mps-batch-max must be >= --mps-batch-min")
+            }
+        }
+        let mpsBatchMinFinal = mpsBatchAuto ? mpsBatchMin : mpsBatch
+        let mpsBatchMaxFinal = mpsBatchAuto ? mpsBatchMax : mpsBatch
+        let mpsBatchAutoFinal = mpsBatchAuto
         let mpsInflightFinal = max(1, mpsInflight)
         let claimSizeFinal = claimSize
         let mpsReinitIntervalNs: UInt64 = {
@@ -80,8 +132,27 @@ enum ExploreRunner {
             return UInt64(ns)
         }()
 
+        let baseSeedForStride = normalizeV2Seed(startSeed ?? UInt64.random(in: V2SeedSpace.min..<(V2SeedSpace.maxExclusive)))
+
+        var resolvedBackend = backend
+        var mpsScorer: MPSScorer? = nil
+        if backend == .mps || backend == .all {
+            do {
+                mpsScorer = try MPSScorer(batchSize: mpsBatch, inflight: mpsInflightFinal)
+            } catch {
+                if backend == .all {
+                    emit(.warning, "Warning: failed to initialize MPS backend (\(error)); falling back to --backend cpu")
+                    resolvedBackend = .cpu
+                } else {
+                    throw error
+                }
+            }
+        }
+
+        let resolvedBackendFinal = resolvedBackend
+
         let cpuThreadCount: Int = {
-            switch backend {
+            switch resolvedBackendFinal {
             case .cpu:
                 return max(1, threads ?? ProcessInfo.processInfo.activeProcessorCount)
             case .mps:
@@ -95,7 +166,7 @@ enum ExploreRunner {
 
         let topN: Int = {
             if let v = topNArg { return max(0, v) }
-            switch backend {
+            switch resolvedBackendFinal {
             case .mps, .all:
                 return 10
             case .cpu:
@@ -103,60 +174,78 @@ enum ExploreRunner {
             }
         }()
 
-        let baseSeedForStride = normalizeV2Seed(startSeed ?? UInt64.random(in: V2SeedSpace.min..<(V2SeedSpace.maxExclusive)))
-
-        var resolvedBackend = backend
-        var mpsScorer: MPSScorer? = nil
-        var mpsScorer2: MPSScorer? = nil
-        var resolvedTwoStage = mpsTwoStage
-
-        if backend == .mps || backend == .all {
-            if mpsTwoStage {
-                guard mpsStage1Size > 0, mpsStage1Size < 128, (mpsStage1Size & (mpsStage1Size - 1)) == 0 else {
-                    throw GobxError.usage("Invalid --mps-stage1-size: \(mpsStage1Size) (expected power-of-two < 128)\n\n\(gobxHelpText)")
-                }
-            }
-            do {
-                if mpsTwoStage {
-                    mpsScorer = try MPSScorer(batchSize: mpsBatch, imageSize: mpsStage1Size, inflight: mpsInflightFinal)
-                    mpsScorer2 = try MPSScorer(batchSize: max(1, mpsStage2Batch), imageSize: 128, inflight: 1)
-                } else {
-                    mpsScorer = try MPSScorer(batchSize: mpsBatch, inflight: mpsInflightFinal)
-                }
-            } catch {
-                var fellBackToSingleStage = false
-                if mpsTwoStage {
-                    do {
-                        mpsScorer = try MPSScorer(batchSize: mpsBatch, inflight: mpsInflightFinal)
-                        mpsScorer2 = nil
-                        resolvedTwoStage = false
-                        fellBackToSingleStage = true
-                        emit(.warning, "Warning: failed to initialize two-stage MPS (\(error)); falling back to single-stage 128")
-                    } catch {
-                        // keep original error handling below
-                    }
-                }
-                if fellBackToSingleStage {
-                    // Keep resolvedBackend as-is (MPS still available).
-                } else if backend == .all {
-                    emit(.warning, "Warning: failed to initialize MPS backend (\(error)); falling back to --backend cpu")
-                    resolvedBackend = .cpu
-                    resolvedTwoStage = false
-                } else {
-                    throw error
-                }
-            }
-        }
-
-        let resolvedBackendFinal = resolvedBackend
-        let mpsTwoStageFinal = resolvedTwoStage && (resolvedBackendFinal == .mps || resolvedBackendFinal == .all)
-
         let stats = ExploreStats()
         let best = BestTracker()
         let bestApprox = ApproxBestTracker()
-        let bestApproxStage1 = ApproxBestTracker()
         let stop = StopFlag()
         let topApproxTracker = TopApproxTracker(limit: topN)
+
+        var memGuardTimer: DispatchSourceTimer? = nil
+        let usesMps = resolvedBackendFinal == .mps || resolvedBackendFinal == .all
+        if memGuardMaxFracSpecified, memGuardMaxFrac > 1.0 {
+            throw GobxError.usage("--mem-guard-frac must be between 0 and 1")
+        }
+        let memGuardLimitBytes: UInt64? = {
+            let physicalMemory = ProcessInfo.processInfo.physicalMemory
+            var explicitLimits: [UInt64] = []
+            var explicitDisable = false
+
+            if memGuardMaxGBSpecified {
+                if memGuardMaxGB <= 0 {
+                    explicitDisable = true
+                } else {
+                    let bytes = UInt64(memGuardMaxGB * 1024.0 * 1024.0 * 1024.0)
+                    explicitLimits.append(bytes)
+                }
+            }
+            if memGuardMaxFracSpecified {
+                if memGuardMaxFrac <= 0 {
+                    explicitDisable = true
+                } else {
+                    let bytes = UInt64(Double(physicalMemory) * memGuardMaxFrac)
+                    explicitLimits.append(bytes)
+                }
+            }
+
+            if let limit = explicitLimits.min() {
+                return limit
+            }
+            if explicitDisable {
+                return nil
+            }
+            guard usesMps else { return nil }
+
+            let defaultFrac = 0.8
+            return UInt64(Double(physicalMemory) * defaultFrac)
+        }()
+
+        if let limitBytes = memGuardLimitBytes {
+            let interval: Double = {
+                if memGuardEverySec.isFinite {
+                    return max(0.25, memGuardEverySec)
+                }
+                return 5.0
+            }()
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+            timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(200))
+            timer.setEventHandler {
+                if stop.isStopRequested() { return }
+                guard let snap = ProcessMemory.snapshot() else { return }
+                if snap.physFootprintBytes >= limitBytes {
+                    let usedGiB = Double(snap.physFootprintBytes) / 1_073_741_824.0
+                    let limitGiB = Double(limitBytes) / 1_073_741_824.0
+                    emit(.warning, String(format: "Memory guard: phys_footprint=%.2fGiB limit=%.2fGiB; stopping to avoid Jetsam", usedGiB, limitGiB))
+                    stop.requestStop()
+                    timer.cancel()
+                }
+            }
+            timer.resume()
+            memGuardTimer = timer
+
+            let physGiB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+            let limitGiB = Double(limitBytes) / 1_073_741_824.0
+            emit(.info, String(format: "Memory guard enabled: limit=%.2fGiB (phys=%.2fGiB) interval=%.2fs", limitGiB, physGiB, interval))
+        }
 
         var seedAllocator: SeedRangeAllocator? = nil
         var seedStateTimer: DispatchSourceTimer? = nil
@@ -231,48 +320,62 @@ enum ExploreRunner {
         var submission: SubmissionManager? = nil
         var refreshTimer: DispatchSourceTimer? = nil
 
-        var effectiveDoSubmit = doSubmit
+        let effectiveDoSubmit = doSubmit
         if effectiveDoSubmit {
-            if config?.profile == nil {
-                emit(.warning, "Warning: --submit requested but no config/profile found at \(GobxPaths.configURL.path)")
-                effectiveDoSubmit = false
-            } else if let cfg = config {
-                let state = SubmissionState()
-                if let top = await fetchTop(limit: 500, config: cfg) {
-                    state.mergeTop(top)
-                    let snap = state.snapshot()
-                    if !minScoreSpecified, snap.top500Threshold.isFinite {
-                        emit(.info, "Calibrated min-score from \(minScore) to \(snap.top500Threshold) (Rank #\(top.images.count))")
-                        minScore = snap.top500Threshold
+            let defaultProfile = AppConfig.Profile.defaultAuthor
+            let configForSubmit: AppConfig = {
+                if let cfg = config {
+                    if cfg.profile == nil {
+                        let handle = defaultProfile.xProfile.map { "@\($0)" } ?? "(none)"
+                        emit(.warning, "No profile configured at \(GobxPaths.configURL.path); using default author profile id=\(defaultProfile.id) name=\(defaultProfile.name) x=\(handle)")
+                        return AppConfig(baseUrl: cfg.baseUrl, profile: defaultProfile)
                     }
-                    emit(.info, "Cached \(snap.knownCount) known seeds. Top500 threshold=\(String(format: "%.6f", snap.top500Threshold))")
-                } else {
-                    emit(.warning, "Warning: failed to fetch top 500; submissions may be rejected until refresh succeeds")
+                    return cfg
                 }
+                let handle = defaultProfile.xProfile.map { "@\($0)" } ?? "(none)"
+                emit(.warning, "No config found at \(GobxPaths.configURL.path); using default author profile id=\(defaultProfile.id) name=\(defaultProfile.name) x=\(handle)")
+                return AppConfig(baseUrl: nil, profile: defaultProfile)
+            }()
 
-                if let p = cfg.profile {
-                    emit(.info, "Participating as \(p.name) (\(p.id))")
+            let state = SubmissionState()
+            if topUniqueUsers {
+                emit(.info, "Using unique-user top list for thresholds")
+            }
+            if let top = await fetchTop(limit: 500, config: configForSubmit, uniqueUsers: topUniqueUsers) {
+                state.mergeTop(top)
+                let snap = state.snapshot()
+                if !minScoreSpecified, snap.top500Threshold.isFinite {
+                    emit(.info, "Calibrated min-score from \(minScore) to \(snap.top500Threshold) (Rank #\(top.images.count))")
+                    minScore = snap.top500Threshold
                 }
+                emit(.info, "Cached \(snap.knownCount) known seeds. Top500 threshold=\(String(format: "%.6f", snap.top500Threshold))")
+            } else {
+                emit(.warning, "Warning: failed to fetch top 500; submissions may be rejected until refresh succeeds")
+            }
 
-                submission = SubmissionManager(config: cfg, state: state, userMinScore: minScore, printLock: printLock, events: eventLog)
+            if let p = configForSubmit.profile {
+                emit(.info, "Participating as \(p.name) (\(p.id))")
+            }
 
-                let interval = max(10.0, refreshEverySec)
-                if interval.isFinite && interval > 0 {
-                    let submissionForRefresh = submission
-                    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-                    timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(2))
-                    timer.setEventHandler { submissionForRefresh?.enqueueRefreshTop500(limit: 500, reason: "timer") }
-                    timer.resume()
-                    refreshTimer = timer
-                }
+            submission = SubmissionManager(
+                config: configForSubmit,
+                state: state,
+                userMinScore: minScore,
+                topUniqueUsers: topUniqueUsers,
+                printLock: printLock,
+                events: eventLog
+            )
+
+            let interval = max(10.0, refreshEverySec)
+            if interval.isFinite && interval > 0 {
+                let submissionForRefresh = submission
+                let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+                timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(2))
+                timer.setEventHandler { submissionForRefresh?.enqueueRefreshTop500(limit: 500, reason: "timer") }
+                timer.resume()
+                refreshTimer = timer
             }
         }
-
-        let mpsCandidateVerifier: CandidateVerifier? = {
-            guard effectiveDoSubmit else { return nil }
-            guard resolvedBackendFinal == .mps || resolvedBackendFinal == .all else { return nil }
-            return CandidateVerifier(best: best, submission: submission, printLock: printLock, events: eventLog, stats: stats)
-        }()
 
         if effectiveDoSubmit, !mpsMarginSpecified, (resolvedBackendFinal == .mps || resolvedBackendFinal == .all) {
             if let cal = CalibrateMPS.loadIfValid(optLevel: 1) {
@@ -283,14 +386,28 @@ enum ExploreRunner {
             }
         }
 
-        if mpsTwoStageFinal, !mpsStage1MarginSpecified {
-            if let cal = CalibrateMPSStage1.loadIfValid(optLevel: 1, stage1Size: mpsStage1Size) {
-                mpsStage1Margin = max(0.0, cal.recommendedMargin)
-                emit(.info, "Loaded MPS stage1 calibration: stage1-margin=\(String(format: "%.6f", mpsStage1Margin)) q=\(String(format: "%.4f", cal.quantile)) verified=\(cal.verifiedCount) size=\(mpsStage1Size)")
-            } else {
-                emit(.warning, "No valid MPS stage1 calibration found; run: gobx calibrate-mps-stage1 (or set --mps-stage1-margin explicitly)")
-            }
+        let mpsMarginAutoFinal = mpsMarginAuto && effectiveDoSubmit && (resolvedBackendFinal == .mps || resolvedBackendFinal == .all)
+        let mpsMarginTracker = AdaptiveMargin(initial: mpsVerifyMargin, autoEnabled: mpsMarginAutoFinal)
+        if mpsMarginAutoFinal {
+            emit(.info, "Adaptive mps-margin enabled: initial=\(String(format: "%.6f", mpsMarginTracker.current()))")
         }
+
+        let candidateVerifier: CandidateVerifier? = {
+            guard effectiveDoSubmit else { return nil }
+            switch resolvedBackendFinal {
+            case .mps, .all:
+                return CandidateVerifier(
+                    best: best,
+                    submission: submission,
+                    printLock: printLock,
+                    events: eventLog,
+                    stats: stats,
+                    margin: mpsMarginTracker
+                )
+            case .cpu:
+                return nil
+            }
+        }()
 
         var reportTimer: DispatchSourceTimer? = nil
         if endless, !uiEnabledFinal, reportEverySec.isFinite, reportEverySec > 0 {
@@ -319,16 +436,13 @@ enum ExploreRunner {
                 let cpuDelta = Double(snap.cpuCount &- state.lastSnap.cpuCount)
                 let cpuVerifyDelta = Double(snap.cpuVerifyCount &- state.lastSnap.cpuVerifyCount)
                 let mpsDelta = Double(snap.mpsCount &- state.lastSnap.mpsCount)
-                let mps2Delta = Double(snap.mps2Count &- state.lastSnap.mps2Count)
                 let cpuRate = cpuDelta / dt
                 let cpuVerifyRate = cpuVerifyDelta / dt
                 let mpsRate = mpsDelta / dt
-                let mps2Rate = mps2Delta / dt
 
                 let cpuAvg = snap.cpuCount > 0 ? snap.cpuScoreSum / Double(snap.cpuCount) : 0.0
                 let cpuVerifyAvg = snap.cpuVerifyCount > 0 ? snap.cpuVerifyScoreSum / Double(snap.cpuVerifyCount) : 0.0
                 let mpsAvg = snap.mpsCount > 0 ? snap.mpsScoreSum / Double(snap.mpsCount) : 0.0
-                let mps2Avg = snap.mps2Count > 0 ? snap.mps2ScoreSum / Double(snap.mps2Count) : 0.0
 
                 let totalCount = snap.cpuCount &+ snap.mpsCount &+ snap.cpuVerifyCount
                 let totalSum = snap.cpuScoreSum + snap.mpsScoreSum + snap.cpuVerifyScoreSum
@@ -339,31 +453,28 @@ enum ExploreRunner {
                 let elapsed = Double(now - startNs) / 1e9
                 let bestSnap = best.snapshot()
                 let approxSnap = bestApprox.snapshot()
-                let approx1Snap = bestApproxStage1.snapshot()
                 let bestExactStr: String? = {
                     guard bestSnap.score.isFinite else { return nil }
                     return "\(String(format: "%.6f", bestSnap.score)) (\(bestSnap.seed)\(bestSnap.source.map { ",\($0)" } ?? ""))"
                 }()
+                let approxTag: String? = {
+                    switch resolvedBackendFinal {
+                    case .cpu:
+                        return nil
+                    case .mps, .all:
+                        return "mps"
+                    }
+                }()
                 let bestApproxStr: String? = {
-                    guard resolvedBackendFinal != .cpu else { return nil }
+                    guard let tag = approxTag else { return nil }
                     guard approxSnap.score.isFinite else { return nil }
-                    let tag = mpsTwoStageFinal ? "mps128" : "mps"
                     return "≈\(String(format: "%.6f", Double(approxSnap.score))) (\(approxSnap.seed),\(tag))"
                 }()
-                let bestApprox1Str: String? = {
-                    guard mpsTwoStageFinal else { return nil }
-                    guard approx1Snap.score.isFinite else { return nil }
-                    return "≈\(String(format: "%.6f", Double(approx1Snap.score))) (\(approx1Snap.seed),mps\(mpsStage1Size))"
+                let bestStr = bestExactStr ?? bestApproxStr ?? "?"
+                let bestApproxSuffix: String = {
+                    guard bestExactStr != nil, let s = bestApproxStr else { return "" }
+                    return " best≈=\(s)"
                 }()
-                let bestStr = bestExactStr ?? bestApproxStr ?? bestApprox1Str ?? "?"
-                var bestApproxSuffix = ""
-                let bestApprox1Key = "best≈\(mpsStage1Size)"
-                if bestExactStr != nil {
-                    if let s = bestApproxStr { bestApproxSuffix += " best≈=\(s)" }
-                    if let s = bestApprox1Str { bestApproxSuffix += " \(bestApprox1Key)=\(s)" }
-                } else if bestApproxStr != nil, let s = bestApprox1Str {
-                    bestApproxSuffix = " \(bestApprox1Key)=\(s)"
-                }
 
                 var thrSuffix = ""
                 if let sub = submissionForStatus {
@@ -381,42 +492,22 @@ enum ExploreRunner {
                 printLock.withLock {
                     switch resolvedBackendFinal {
                     case .all:
-                        if mpsTwoStageFinal {
-                            let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f) mps%d=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)",
-                                              elapsed,
-                                              snap.cpuCount, cpuRate, cpuAvg,
-                                              mpsStage1Size,
-                                              snap.mpsCount, mpsRate, mpsAvg,
-                                              snap.mps2Count, mps2Rate, mps2Avg,
-                                              totalCount, totalRate, totalAvg)
-                            print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
-                        } else {
-                            let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)",
-                                              elapsed,
-                                              snap.cpuCount, cpuRate, cpuAvg,
-                                              snap.mpsCount, mpsRate, mpsAvg,
-                                              totalCount, totalRate, totalAvg)
-                            print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
-                        }
+                        let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)",
+                                          elapsed,
+                                          snap.cpuCount, cpuRate, cpuAvg,
+                                          snap.mpsCount, mpsRate, mpsAvg,
+                                          totalCount, totalRate, totalAvg)
+                        print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
                     case .cpu:
                         let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f)",
                                           elapsed,
                                           snap.cpuCount, cpuRate, cpuAvg)
                         print("\(base) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
                     case .mps:
-                        if mpsTwoStageFinal {
-                            let base = String(format: "t=%.1fs mps%d=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f)",
-                                              elapsed,
-                                              mpsStage1Size,
-                                              snap.mpsCount, mpsRate, mpsAvg,
-                                              snap.mps2Count, mps2Rate, mps2Avg)
-                            print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
-                        } else {
-                            let base = String(format: "t=%.1fs mps=%llu (%.0f/s avg=%.6f)",
-                                              elapsed,
-                                              snap.mpsCount, mpsRate, mpsAvg)
-                            print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
-                        }
+                        let base = String(format: "t=%.1fs mps=%llu (%.0f/s avg=%.6f)",
+                                          elapsed,
+                                          snap.mpsCount, mpsRate, mpsAvg)
+                        print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
                     }
                 }
 
@@ -434,16 +525,12 @@ enum ExploreRunner {
                     backend: resolvedBackendFinal,
                     endless: endless,
                     totalTarget: totalTarget,
-                    mpsTwoStage: mpsTwoStageFinal,
-                    mpsStage1Size: mpsStage1Size,
-                    mpsVerifyMargin: mpsVerifyMargin,
-                    stage1Margin: mpsStage1Margin,
+                    mpsVerifyMargin: mpsMarginTracker,
                     minScore: minScore
                 ),
                 stats: stats,
                 best: best,
                 bestApprox: bestApprox,
-                bestApproxStage1: bestApproxStage1,
                 submission: submission,
                 events: eventLog,
                 refreshEverySec: uiRefreshEverySec
@@ -457,10 +544,7 @@ enum ExploreRunner {
         let submissionForWorkers = submission
         let effectiveDoSubmitForWorkers = effectiveDoSubmit
         let minScoreForWorkers = minScore
-        let mpsVerifyMarginForWorkers = mpsVerifyMargin
-        let mpsStage1MarginForWorkers = mpsStage1Margin
         let mpsScorerBox = mpsScorer.map(UnsafeSendableBox.init)
-        let mpsScorer2Box = mpsScorer2.map(UnsafeSendableBox.init)
 
         if resolvedBackendFinal == .cpu || resolvedBackendFinal == .all {
             group.enter()
@@ -482,6 +566,7 @@ enum ExploreRunner {
                     best: best,
                     submission: submissionForWorkers,
                     effectiveDoSubmit: effectiveDoSubmitForWorkers,
+                    minScore: minScoreForWorkers,
                     stop: stop
                 ))
                 worker.run()
@@ -492,7 +577,7 @@ enum ExploreRunner {
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 defer { group.leave() }
-                guard let stage1Scorer = mpsScorerBox?.value else { return }
+                guard let scorer = mpsScorerBox?.value else { return }
 
                 let manager = ExploreMPSManager(params: .init(
                     resolvedBackend: resolvedBackendFinal,
@@ -502,27 +587,25 @@ enum ExploreRunner {
                     mpsBatch: mpsBatch,
                     mpsInflight: mpsInflightFinal,
                     mpsReinitIntervalNs: mpsReinitIntervalNs,
-                    twoStage: mpsTwoStageFinal,
-                    stage1Size: mpsStage1Size,
-                    stage1Margin: mpsStage1MarginForWorkers,
-                    stage2Batch: max(1, mpsStage2Batch),
+                    mpsBatchAuto: mpsBatchAutoFinal,
+                    mpsBatchMin: mpsBatchMinFinal,
+                    mpsBatchMax: mpsBatchMaxFinal,
+                    mpsBatchTuneEverySec: mpsBatchTuneEverySec,
                     claimSize: claimSizeFinal,
                     allocator: seedAllocatorForWorkers,
                     baseSeed: baseSeedForStride,
                     minScore: minScoreForWorkers,
-                    mpsVerifyMargin: mpsVerifyMarginForWorkers,
+                    mpsVerifyMargin: mpsMarginTracker,
                     effectiveDoSubmit: effectiveDoSubmitForWorkers,
                     submission: submissionForWorkers,
-                    verifier: mpsCandidateVerifier,
+                    verifier: candidateVerifier,
                     printLock: printLock,
                     events: eventLog,
                     stats: stats,
                     bestApprox: bestApprox,
-                    bestApproxStage1: bestApproxStage1,
                     topApproxTracker: topApproxTracker,
                     stop: stop,
-                    stage1Scorer: stage1Scorer,
-                    stage2Scorer: mpsScorer2Box?.value
+                    scorer: scorer
                 ))
                 manager.run()
             }
@@ -530,13 +613,12 @@ enum ExploreRunner {
 
         await waitForDispatchGroup(group)
 
-        ui?.stop()
-
         refreshTimer?.cancel()
         reportTimer?.cancel()
         seedStateTimer?.cancel()
+        memGuardTimer?.cancel()
 
-        mpsCandidateVerifier?.wait()
+        candidateVerifier?.wait()
         submission?.waitForPendingSubmissions()
 
         if topN > 0, resolvedBackendFinal != .cpu {
@@ -562,28 +644,26 @@ enum ExploreRunner {
         let cpuRate = Double(snap.cpuCount) / max(1e-9, dt)
         let cpuVerifyRate = Double(snap.cpuVerifyCount) / max(1e-9, dt)
         let mpsRate = Double(snap.mpsCount) / max(1e-9, dt)
-        let mps2Rate = Double(snap.mps2Count) / max(1e-9, dt)
         let totalCount = snap.cpuCount &+ snap.mpsCount &+ snap.cpuVerifyCount
         let totalRate = Double(totalCount) / max(1e-9, dt)
         let cpuAvg = snap.cpuCount > 0 ? snap.cpuScoreSum / Double(snap.cpuCount) : 0.0
         let cpuVerifyAvg = snap.cpuVerifyCount > 0 ? snap.cpuVerifyScoreSum / Double(snap.cpuVerifyCount) : 0.0
         let mpsAvg = snap.mpsCount > 0 ? snap.mpsScoreSum / Double(snap.mpsCount) : 0.0
-        let mps2Avg = snap.mps2Count > 0 ? snap.mps2ScoreSum / Double(snap.mps2Count) : 0.0
         let totalAvg = totalCount > 0 ? (snap.cpuScoreSum + snap.mpsScoreSum + snap.cpuVerifyScoreSum) / Double(totalCount) : 0.0
         let bestSnap = best.snapshot()
         let approxSnap = bestApprox.snapshot()
-        let approx1Snap = bestApproxStage1.snapshot()
         let bestFinal: (seed: UInt64, score: Double, tag: String) = {
             if bestSnap.score.isFinite {
                 let tag = bestSnap.source.map { " (\($0))" } ?? ""
                 return (bestSnap.seed, bestSnap.score, tag)
             }
-            if approxSnap.score.isFinite, resolvedBackendFinal != .cpu {
-                let tag = mpsTwoStageFinal ? " (mps128≈)" : " (mps≈)"
-                return (approxSnap.seed, Double(approxSnap.score), tag)
-            }
-            if mpsTwoStageFinal, approx1Snap.score.isFinite, resolvedBackendFinal != .cpu {
-                return (approx1Snap.seed, Double(approx1Snap.score), " (mps\(mpsStage1Size)≈)")
+            if approxSnap.score.isFinite {
+                switch resolvedBackendFinal {
+                case .cpu:
+                    break
+                case .mps, .all:
+                    return (approxSnap.seed, Double(approxSnap.score), " (mps≈)")
+                }
             }
             return (0, -Double.infinity, "")
         }()
@@ -594,59 +674,26 @@ enum ExploreRunner {
         }()
 
         printLock.withLock {
-            if resolvedBackendFinal == .all {
-                if mpsTwoStageFinal {
-                    print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps%d=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
-                                 dt,
-                                 snap.cpuCount, cpuRate, cpuAvg,
-                                 mpsStage1Size,
-                                 snap.mpsCount, mpsRate, mpsAvg,
-                                 snap.mps2Count, mps2Rate, mps2Avg,
-                                 totalCount, totalRate, totalAvg,
-                                 cpuVerifySuffix,
-                                 bestFinal.score, bestFinal.seed, bestFinal.tag))
-                } else {
-                    print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
-                                 dt,
-                                 snap.cpuCount, cpuRate, cpuAvg,
-                                 snap.mpsCount, mpsRate, mpsAvg,
-                                 totalCount, totalRate, totalAvg,
-                                 cpuVerifySuffix,
-                                 bestFinal.score, bestFinal.seed, bestFinal.tag))
-                }
-            } else if resolvedBackendFinal == .cpu {
+            switch resolvedBackendFinal {
+            case .all:
+                print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
+                             dt,
+                             snap.cpuCount, cpuRate, cpuAvg,
+                             snap.mpsCount, mpsRate, mpsAvg,
+                             totalCount, totalRate, totalAvg,
+                             cpuVerifySuffix,
+                             bestFinal.score, bestFinal.seed, bestFinal.tag))
+            case .cpu:
                 print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) best=%.6f (%llu)%@",
                              dt,
                              snap.cpuCount, cpuRate, cpuAvg,
                              bestFinal.score, bestFinal.seed, bestFinal.tag))
-            } else {
-                if mpsTwoStageFinal {
-                    print(String(format: "elapsed=%.2fs mps%d=%llu (%.0f/s avg=%.6f) mps128=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
-                                 dt,
-                                 mpsStage1Size,
-                                 snap.mpsCount, mpsRate, mpsAvg,
-                                 snap.mps2Count, mps2Rate, mps2Avg,
-                                 cpuVerifySuffix,
-                                 bestFinal.score, bestFinal.seed, bestFinal.tag))
-                } else {
-                    print(String(format: "elapsed=%.2fs mps=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
-                                 dt,
-                                 snap.mpsCount, mpsRate, mpsAvg,
-                                 cpuVerifySuffix,
-                                 bestFinal.score, bestFinal.seed, bestFinal.tag))
-                }
-            }
-            if !endless {
-                print("requestedCount=\(total)")
-            }
-        }
-    }
-
-    private static func waitForDispatchGroup(_ group: DispatchGroup) async {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                group.wait()
-                continuation.resume()
+            case .mps:
+                print(String(format: "elapsed=%.2fs mps=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
+                             dt,
+                             snap.mpsCount, mpsRate, mpsAvg,
+                             cpuVerifySuffix,
+                             bestFinal.score, bestFinal.seed, bestFinal.tag))
             }
         }
     }

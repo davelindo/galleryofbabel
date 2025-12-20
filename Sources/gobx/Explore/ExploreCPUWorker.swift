@@ -17,6 +17,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
         let best: BestTracker
         let submission: SubmissionManager?
         let effectiveDoSubmit: Bool
+        let minScore: Double
         let stop: StopFlag
     }
 
@@ -58,7 +59,10 @@ final class ExploreCPUWorker: @unchecked Sendable {
                 return
             }
 
-            let source = p.resolvedBackend == .all ? "cpu" : nil
+            let source: String? = {
+                if p.resolvedBackend == .all { return "cpu" }
+                return nil
+            }()
 
             let startMsg: String = {
                 if p.resolvedBackend == .all {
@@ -67,11 +71,12 @@ final class ExploreCPUWorker: @unchecked Sendable {
                     }
                     return "CPU thread \(tid) start: \(seed) stride=\(stride) count=\(quota.map(String.init) ?? "∞")"
                 }
+                let label = "Thread"
                 if useState {
-                    return "Thread \(tid) start: \(seed) claim=\(p.claimSize) count=\(p.endless ? "∞" : "\(p.total)")"
+                    return "\(label) \(tid) start: \(seed) claim=\(p.claimSize) count=\(p.endless ? "∞" : "\(p.total)")"
                 }
                 let cpuStride = UInt64(max(1, p.threadCount))
-                return "Thread \(tid) start: \(seed) stride=\(cpuStride) count=\(quota.map(String.init) ?? "∞")"
+                return "\(label) \(tid) start: \(seed) stride=\(cpuStride) count=\(quota.map(String.init) ?? "∞")"
             }()
 
             if let events = p.events {
@@ -106,8 +111,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
                     remainingInClaim -= 1
                 }
 
-                let r = scorer.score(seed: seed)
-                let score = r.totalScore
+                let score = scorer.score(seed: seed).totalScore
 
                 processed += 1
                 flushCount += 1

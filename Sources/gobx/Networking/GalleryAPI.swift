@@ -12,6 +12,12 @@ struct AppConfig: Codable {
         let id: String
         let name: String
         let xProfile: String?
+
+        static let defaultAuthor = Profile(
+            id: "user_mj95qm9x_adu1a3a11",
+            name: "DreamingDragon588",
+            xProfile: "davelindon10"
+        )
     }
 }
 
@@ -101,9 +107,10 @@ struct TopResponse: Decodable {
     let images: [Image]
 }
 
-func fetchTop(limit: Int, config: AppConfig) async -> TopResponse? {
+func fetchTop(limit: Int, config: AppConfig, uniqueUsers: Bool = false) async -> TopResponse? {
     let base = config.baseUrl ?? "https://www.echohive.ai"
-    let urlStr = base + "/gallery-of-babel/api/top?limit=\(limit)&unique_users=0"
+    let unique = uniqueUsers ? "1" : "0"
+    let urlStr = base + "/gallery-of-babel/api/top?limit=\(limit)&unique_users=\(unique)"
     guard let url = URL(string: urlStr) else { return nil }
     guard let res = await runHTTP(url: url, method: "GET", jsonBody: nil, timeoutSec: 15) else { return nil }
     guard res.statusCode == 200 else { return nil }

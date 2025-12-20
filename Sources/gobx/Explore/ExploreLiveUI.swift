@@ -7,10 +7,7 @@ final class ExploreLiveUI: @unchecked Sendable {
         let backend: Backend
         let endless: Bool
         let totalTarget: Int?
-        let mpsTwoStage: Bool
-        let mpsStage1Size: Int
-        let mpsVerifyMargin: Double
-        let stage1Margin: Double
+        let mpsVerifyMargin: AdaptiveMargin
         let minScore: Double
     }
 
@@ -18,7 +15,6 @@ final class ExploreLiveUI: @unchecked Sendable {
     private let stats: ExploreStats
     private let best: BestTracker
     private let bestApprox: ApproxBestTracker
-    private let bestApproxStage1: ApproxBestTracker
     private let submission: SubmissionManager?
     private let events: ExploreEventLog
     private let refreshEverySec: Double
@@ -33,14 +29,12 @@ final class ExploreLiveUI: @unchecked Sendable {
     private var totalRateHistory: [Double] = []
     private var cpuRateHistory: [Double] = []
     private var mpsRateHistory: [Double] = []
-    private var mps2RateHistory: [Double] = []
 
     init(
         context: Context,
         stats: ExploreStats,
         best: BestTracker,
         bestApprox: ApproxBestTracker,
-        bestApproxStage1: ApproxBestTracker,
         submission: SubmissionManager?,
         events: ExploreEventLog,
         refreshEverySec: Double
@@ -49,7 +43,6 @@ final class ExploreLiveUI: @unchecked Sendable {
         self.stats = stats
         self.best = best
         self.bestApprox = bestApprox
-        self.bestApproxStage1 = bestApproxStage1
         self.submission = submission
         self.events = events
         self.refreshEverySec = max(0.1, refreshEverySec)
@@ -95,11 +88,9 @@ final class ExploreLiveUI: @unchecked Sendable {
         let cpuDelta = Double(snap.cpuCount &- lastSnap.cpuCount)
         let cpuVerifyDelta = Double(snap.cpuVerifyCount &- lastSnap.cpuVerifyCount)
         let mpsDelta = Double(snap.mpsCount &- lastSnap.mpsCount)
-        let mps2Delta = Double(snap.mps2Count &- lastSnap.mps2Count)
         let cpuRate = dt > 0 ? cpuDelta / dt : 0
         let cpuVerifyRate = dt > 0 ? cpuVerifyDelta / dt : 0
         let mpsRate = dt > 0 ? mpsDelta / dt : 0
-        let mps2Rate = dt > 0 ? mps2Delta / dt : 0
         let progressDelta = cpuDelta + mpsDelta
         let totalDelta = progressDelta + cpuVerifyDelta
         let totalRate = dt > 0 ? totalDelta / dt : 0
@@ -110,7 +101,6 @@ final class ExploreLiveUI: @unchecked Sendable {
         push(&totalRateHistory, totalRate, cap: 60)
         push(&cpuRateHistory, cpuRate, cap: 60)
         push(&mpsRateHistory, mpsRate, cap: 60)
-        push(&mps2RateHistory, mps2Rate, cap: 60)
 
         let elapsed = Double(now &- startNs) / 1e9
         let size = Terminal.stdoutSize()
@@ -121,34 +111,34 @@ final class ExploreLiveUI: @unchecked Sendable {
 
         let bestSnap = best.snapshot()
         let approxSnap = bestApprox.snapshot()
-        let approx1Snap = bestApproxStage1.snapshot()
         let bestExactStr: String? = {
             guard bestSnap.score.isFinite else { return nil }
             let tag = bestSnap.source.map { ",\($0)" } ?? ""
             return "\(String(format: "%.6f", bestSnap.score)) (\(bestSnap.seed)\(tag))"
         }()
+        let approxTag: String? = {
+            switch ctx.backend {
+            case .cpu:
+                return nil
+            case .mps, .all:
+                return "mps"
+            }
+        }()
         let bestApproxStr: String? = {
-            guard ctx.backend != .cpu else { return nil }
+            guard let tag = approxTag else { return nil }
             guard approxSnap.score.isFinite else { return nil }
-            let tag = ctx.mpsTwoStage ? "mps128" : "mps"
             return "≈\(String(format: "%.6f", Double(approxSnap.score))) (\(approxSnap.seed),\(tag))"
         }()
-        let bestApprox1Str: String? = {
-            guard ctx.mpsTwoStage else { return nil }
-            guard approx1Snap.score.isFinite else { return nil }
-            return "≈\(String(format: "%.6f", Double(approx1Snap.score))) (\(approx1Snap.seed),mps\(ctx.mpsStage1Size))"
-        }()
-        let bestStr = bestExactStr ?? bestApproxStr ?? bestApprox1Str ?? "?"
+        let bestStr = bestExactStr ?? bestApproxStr ?? "?"
 
         let cpuMeanStd = meanStd(count: snap.cpuCount, sum: snap.cpuScoreSum, sumSq: snap.cpuScoreSumSq)
         let cpuVerifyMeanStd = meanStd(count: snap.cpuVerifyCount, sum: snap.cpuVerifyScoreSum, sumSq: snap.cpuVerifyScoreSumSq)
         let mpsMeanStd = meanStd(count: snap.mpsCount, sum: snap.mpsScoreSum, sumSq: snap.mpsScoreSumSq)
-        let mps2MeanStd = meanStd(count: snap.mps2Count, sum: snap.mps2ScoreSum, sumSq: snap.mps2ScoreSumSq)
 
         let cpuEta = etaString(rate: cpuRate, meanStd: cpuMeanStd, threshold: thr)
-        let mpsGate = thr - ctx.mpsVerifyMargin
-        let mpsEta = etaString(rate: mpsRate, meanStd: mpsMeanStd, threshold: mpsGate)
-        let mps2Eta = etaString(rate: mps2Rate, meanStd: mps2MeanStd, threshold: mpsGate)
+        let margin = ctx.mpsVerifyMargin.current()
+        let approxGate = thr - margin
+        let mpsEta = etaString(rate: mpsRate, meanStd: mpsMeanStd, threshold: approxGate)
 
         var lines: [String] = []
         lines.reserveCapacity(size.rows)
@@ -168,11 +158,8 @@ final class ExploreLiveUI: @unchecked Sendable {
         if top500.isFinite {
             thrLine += "  top500=\(fmt(top500))"
         }
-        if ctx.mpsVerifyMargin > 0 {
-            thrLine += "  mps-margin=\(fmt(ctx.mpsVerifyMargin))"
-        }
-        if ctx.mpsTwoStage {
-            thrLine += "  stage1-margin=\(fmt(ctx.stage1Margin))"
+        if margin > 0, ctx.backend == .mps || ctx.backend == .all {
+            thrLine += "  mps-margin=\(fmt(margin))"
         }
         lines.append(truncateANSI("\(ANSI.gray)\(thrLine)\(ANSI.reset)", cols: size.cols))
 
@@ -185,22 +172,11 @@ final class ExploreLiveUI: @unchecked Sendable {
         }
 
         if ctx.backend == .mps || ctx.backend == .all {
-            if ctx.mpsTwoStage {
-                let mean1 = mpsMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
-                let mean2 = mps2MeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
-                let eta2 = mps2Eta.map { "ETA(gate)≈\($0)" } ?? "ETA(gate)=?"
-                let s1 = max(1, ctx.mpsStage1Size)
-                lines.append(truncateANSI("\(ANSI.magenta)MPS\(s1)\(ANSI.reset) \(fmtCount(snap.mpsCount))  \(fmtRate(mpsRate))/s  \(mean1)", cols: size.cols))
-                lines.append(truncateANSI("\(ANSI.magenta)MPS128\(ANSI.reset) \(fmtCount(snap.mps2Count))  \(fmtRate(mps2Rate))/s  \(mean2)  \(eta2)", cols: size.cols))
-            } else {
-                let meanStr = mpsMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
-                let etaStr = mpsEta.map { "ETA(gate)≈\($0)" } ?? "ETA(gate)=?"
-                lines.append(truncateANSI("\(ANSI.magenta)MPS\(ANSI.reset)  \(fmtCount(snap.mpsCount))  \(fmtRate(mpsRate))/s  \(meanStr)  \(etaStr)", cols: size.cols))
-            }
-            if snap.cpuVerifyCount > 0 {
-                let meanVerify = cpuVerifyMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
-                lines.append(truncateANSI("\(ANSI.green)CPUv\(ANSI.reset)  \(fmtCount(snap.cpuVerifyCount))  \(fmtRate(cpuVerifyRate))/s  \(meanVerify)", cols: size.cols))
-            }
+            let meanStr = mpsMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
+            let etaStr = mpsEta.map { "ETA(gate)≈\($0)" } ?? "ETA(gate)=?"
+            lines.append(truncateANSI("\(ANSI.magenta)MPS\(ANSI.reset)  \(fmtCount(snap.mpsCount))  \(fmtRate(mpsRate))/s  \(meanStr)  \(etaStr)", cols: size.cols))
+            let meanVerify = cpuVerifyMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
+            lines.append(truncateANSI("\(ANSI.green)CPUv\(ANSI.reset)  \(fmtCount(snap.cpuVerifyCount))  \(fmtRate(cpuVerifyRate))/s  \(meanVerify)", cols: size.cols))
         }
 
         let progressCount = snap.cpuCount &+ snap.mpsCount
