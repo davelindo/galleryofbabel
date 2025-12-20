@@ -25,8 +25,6 @@ enum GobxCLI {
                 try BenchMPS.runWorker(args: rest)
             case "calibrate-mps":
                 try CalibrateMPS.run(args: rest)
-            case "calibrate-mps-stage1":
-                try CalibrateMPSStage1.run(args: rest)
             case "explore":
                 try await ExploreCommand.run(args: rest)
             default:

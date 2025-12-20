@@ -17,10 +17,6 @@ enum GobxPaths {
         configDir.appendingPathComponent("gobx-mps-calibration.json")
     }
 
-    static var mpsStage1CalibrationURL: URL {
-        configDir.appendingPathComponent("gobx-mps-stage1-calibration.json")
-    }
-
     static func expandPath(_ path: String) -> String {
         (path as NSString).expandingTildeInPath
     }
@@ -29,4 +25,3 @@ enum GobxPaths {
         URL(fileURLWithPath: expandPath(path))
     }
 }
-

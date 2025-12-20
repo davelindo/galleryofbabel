@@ -8,14 +8,23 @@ struct ExploreOptions {
     var threads: Int? = nil
     var batch: Int = 64
     var backend: Backend = .cpu
+    var backendSpecified: Bool = false
     var topN: Int? = nil
 
     var doSubmit: Bool = false
+    var doSubmitSpecified: Bool = false
     var minScore: Double = -8.662
     var minScoreSpecified: Bool = false
+    var topUniqueUsers: Bool = false
+    var topUniqueUsersSpecified: Bool = false
     var refreshEverySec: Double = 180.0
     var reportEverySec: Double = 1.0
     var uiEnabled: Bool? = nil
+    var memGuardMaxGB: Double = 0.0
+    var memGuardMaxFrac: Double = 0.0
+    var memGuardMaxGBSpecified: Bool = false
+    var memGuardMaxFracSpecified: Bool = false
+    var memGuardEverySec: Double = 5.0
 
     var seedMode: SeedMode = .state
     var statePath: String? = nil
@@ -25,14 +34,17 @@ struct ExploreOptions {
 
     var mpsVerifyMargin: Double = 0.0
     var mpsMarginSpecified: Bool = false
+    var mpsMarginAuto: Bool = false
+    var mpsMarginAutoSpecified: Bool = false
     var mpsInflight: Int = 2
     var mpsReinitEverySec: Double = 0.0
-
-    var mpsTwoStage: Bool = false
-    var mpsStage1Size: Int = 64
-    var mpsStage1Margin: Double = 0.2
-    var mpsStage1MarginSpecified: Bool = false
-    var mpsStage2Batch: Int = 64
+    var mpsBatchAuto: Bool = false
+    var mpsBatchAutoSpecified: Bool = false
+    var mpsBatchMin: Int = 0
+    var mpsBatchMax: Int = 0
+    var mpsBatchMinSpecified: Bool = false
+    var mpsBatchMaxSpecified: Bool = false
+    var mpsBatchTuneEverySec: Double = 2.0
 
     var endless: Bool { endlessFlag || count == nil }
 }
@@ -58,10 +70,15 @@ extension ExploreOptions {
                 o.batch = try parser.requireInt(for: "--batch")
             case "--backend":
                 o.backend = try parser.requireEnum(for: "--backend", Backend.self)
+                o.backendSpecified = true
             case "--top":
                 o.topN = try parser.requireInt(for: "--top")
             case "--submit":
                 o.doSubmit = true
+                o.doSubmitSpecified = true
+            case "--top-unique-users":
+                o.topUniqueUsers = true
+                o.topUniqueUsersSpecified = true
             case "--min-score":
                 o.minScore = try parser.requireDouble(for: "--min-score")
                 o.minScoreSpecified = true
@@ -73,6 +90,14 @@ extension ExploreOptions {
                 o.uiEnabled = true
             case "--no-ui":
                 o.uiEnabled = false
+            case "--mem-guard-gb":
+                o.memGuardMaxGB = max(0.0, try parser.requireDouble(for: "--mem-guard-gb"))
+                o.memGuardMaxGBSpecified = true
+            case "--mem-guard-frac":
+                o.memGuardMaxFrac = max(0.0, try parser.requireDouble(for: "--mem-guard-frac"))
+                o.memGuardMaxFracSpecified = true
+            case "--mem-guard-every":
+                o.memGuardEverySec = max(0.25, try parser.requireDouble(for: "--mem-guard-every"))
             case "--seed-mode":
                 o.seedMode = try parser.requireEnum(for: "--seed-mode", SeedMode.self)
             case "--state":
@@ -88,19 +113,24 @@ extension ExploreOptions {
             case "--mps-margin":
                 o.mpsVerifyMargin = try parser.requireDouble(for: "--mps-margin")
                 o.mpsMarginSpecified = true
+            case "--mps-margin-auto":
+                o.mpsMarginAuto = true
+                o.mpsMarginAutoSpecified = true
             case "--mps-inflight":
                 o.mpsInflight = max(1, try parser.requireInt(for: "--mps-inflight"))
             case "--mps-reinit-every":
                 o.mpsReinitEverySec = max(0.0, try parser.requireDouble(for: "--mps-reinit-every"))
-            case "--mps-two-stage":
-                o.mpsTwoStage = true
-            case "--mps-stage1-size":
-                o.mpsStage1Size = try parser.requireInt(for: "--mps-stage1-size")
-            case "--mps-stage1-margin":
-                o.mpsStage1Margin = max(0.0, try parser.requireDouble(for: "--mps-stage1-margin"))
-                o.mpsStage1MarginSpecified = true
-            case "--mps-stage2-batch":
-                o.mpsStage2Batch = max(1, try parser.requireInt(for: "--mps-stage2-batch"))
+            case "--mps-batch-auto":
+                o.mpsBatchAuto = true
+                o.mpsBatchAutoSpecified = true
+            case "--mps-batch-min":
+                o.mpsBatchMin = max(1, try parser.requireInt(for: "--mps-batch-min"))
+                o.mpsBatchMinSpecified = true
+            case "--mps-batch-max":
+                o.mpsBatchMax = max(1, try parser.requireInt(for: "--mps-batch-max"))
+                o.mpsBatchMaxSpecified = true
+            case "--mps-batch-tune-every":
+                o.mpsBatchTuneEverySec = max(0.25, try parser.requireDouble(for: "--mps-batch-tune-every"))
             default:
                 throw parser.unknown(a)
             }

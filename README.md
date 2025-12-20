@@ -12,7 +12,7 @@ It features a dual-backend architecture:
 ## Features
 
 *   **Hybrid Mining:** Uses GPU (MPS) for wide-net searching and CPU for precise verification.
-*   **Two-Stage Pipeline:** Optional low-resolution "Stage 1" (e.g., 64x64) pre-filtering on GPU to discard uninteresting seeds quickly.
+*   **Adaptive MPS Tuning:** Auto-tunes batch size and margin for throughput and accuracy.
 *   **Automated Calibration:** Tools to tune GPU scoring thresholds against CPU ground truth for your specific hardware.
 *   **State Management:** Tracks exploration progress to prevent re-scanning the same seed ranges.
 *   **Live Submission:** Automatically submits qualifying seeds to the Gallery of Babel API.
@@ -61,25 +61,27 @@ To submit findings to the backend, create a configuration file at `~/.config/gal
 }
 ```
 
+If no profile is configured, `gobx explore` will fall back to the default author profile for submissions.
+
 ## Usage
 
 ### 1. Exploration (Mining)
-The main command to search for seeds. By default, it uses the CPU. To enable the GPU:
+The main command to search for seeds. By default, it uses MPS when available and submits results.
 
 ```bash
-# Run endless exploration using Metal (MPS) backend
-gobx explore --backend mps --endless --submit
+# Run endless exploration (uses MPS if available, otherwise CPU)
+gobx explore --endless
 
-# Run with a specific thread count and batch size
-gobx explore --backend mps --batch 64 --mps-inflight 3 --submit
+# Force CPU-only
+gobx explore --backend cpu --endless
+
+# Run with a specific batch size
+gobx explore --backend mps --batch 192 --mps-inflight 2
 ```
 
-**Advanced Optimization (Two-Stage):**
-This renders small thumbnails (64x64) on the GPU first. Only promising candidates are rendered at full size (128x128).
-
-```bash
-gobx explore --backend mps --mps-two-stage --mps-stage1-size 64 --submit
-```
+Defaults:
+- Metal available: `--backend mps --submit --mps-batch-auto --mps-margin-auto --top-unique-users`
+- Metal unavailable: `--backend cpu --submit --top-unique-users`
 
 ### 2. Scoring a Specific Seed
 Verify the score of a known seed.
@@ -99,11 +101,6 @@ Because floating-point operations differ between CPU and GPU, the GPU scorer is 
 Scans random seeds to find the scoring delta between GPU and CPU.
 ```bash
 gobx calibrate-mps --scan 1000000
-```
-
-**Step 2: Calibrate Stage 1 vs Stage 2 (If using two-stage)**
-```bash
-gobx calibrate-mps-stage1 --stage1-size 64 --scan 1000000
 ```
 
 *These commands write calibration files to `~/.config/gallery-of-babel/` which `gobx explore` automatically loads.*
