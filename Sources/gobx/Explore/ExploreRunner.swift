@@ -10,6 +10,8 @@ enum ExploreRunner {
         let batch = options.batch
         var backend = options.backend
         let backendSpecified = options.backendSpecified
+        var gpuBackend = options.gpuBackend
+        let gpuBackendSpecified = options.gpuBackendSpecified
         let topNArg = options.topN
         var doSubmit = options.doSubmit
         let doSubmitSpecified = options.doSubmitSpecified
@@ -18,10 +20,17 @@ enum ExploreRunner {
         var topUniqueUsers = options.topUniqueUsers
         let topUniqueUsersSpecified = options.topUniqueUsersSpecified
         var mpsVerifyMargin = options.mpsVerifyMargin
+        var mpsScoreShift: Double = 0.0
         let mpsMarginSpecified = options.mpsMarginSpecified
         var mpsMarginAuto = options.mpsMarginAuto
         let mpsMarginAutoSpecified = options.mpsMarginAutoSpecified
         let mpsInflight = options.mpsInflight
+        let mpsWorkers = options.mpsWorkers
+        let mpsInflightAuto = options.mpsInflightAuto
+        var mpsInflightMin = options.mpsInflightMin
+        var mpsInflightMax = options.mpsInflightMax
+        let mpsInflightMinSpecified = options.mpsInflightMinSpecified
+        let mpsInflightMaxSpecified = options.mpsInflightMaxSpecified
         let mpsReinitEverySec = options.mpsReinitEverySec
         var mpsBatchAuto = options.mpsBatchAuto
         let mpsBatchAutoSpecified = options.mpsBatchAutoSpecified
@@ -94,6 +103,9 @@ enum ExploreRunner {
         if !backendSpecified {
             backend = metalAvailable ? .mps : .cpu
         }
+        if !gpuBackendSpecified {
+            gpuBackend = .metal
+        }
         if !doSubmitSpecified {
             doSubmit = true
         }
@@ -105,6 +117,9 @@ enum ExploreRunner {
         }
         if !mpsMarginAutoSpecified, backend == .mps || backend == .all {
             mpsMarginAuto = true
+        }
+        if !mpsInflightAuto, backend == .mps || backend == .all {
+            mpsInflightAuto = true
         }
 
         let mpsBatch = max(1, batch)
@@ -124,6 +139,27 @@ enum ExploreRunner {
         let mpsBatchAutoFinal = mpsBatchAuto
         let mpsInflightFinal = max(1, mpsInflight)
         let claimSizeFinal = claimSize
+        if mpsWorkers < 0 {
+            throw GobxError.usage("--mps-workers must be >= 0")
+        }
+        if mpsInflightAuto {
+            if !mpsInflightMinSpecified {
+                mpsInflightMin = max(1, mpsInflightFinal / 2)
+            }
+            if !mpsInflightMaxSpecified {
+                mpsInflightMax = max(mpsInflightFinal, 16)
+            }
+            if mpsInflightMax < mpsInflightMin {
+                throw GobxError.usage("--mps-inflight-max must be >= --mps-inflight-min")
+            }
+        }
+        let mpsInflightStart: Int = {
+            guard mpsInflightAuto else { return mpsInflightFinal }
+            return min(mpsInflightMax, max(mpsInflightMin, mpsInflightFinal))
+        }()
+        let mpsInflightAutoSnapshot = mpsInflightAuto
+        let mpsInflightMinSnapshot = mpsInflightMin
+        let mpsInflightMaxSnapshot = mpsInflightMax
         let mpsReinitIntervalNs: UInt64 = {
             guard mpsReinitEverySec.isFinite && mpsReinitEverySec > 0 else { return 0 }
             let ns = mpsReinitEverySec * 1e9
@@ -135,13 +171,25 @@ enum ExploreRunner {
         let baseSeedForStride = normalizeV2Seed(startSeed ?? UInt64.random(in: V2SeedSpace.min..<(V2SeedSpace.maxExclusive)))
 
         var resolvedBackend = backend
-        var mpsScorer: MPSScorer? = nil
+        var gpuScorer: (any GPUScorer)? = nil
+        var makeScorer: (@Sendable (Int, Int) throws -> any GPUScorer)? = nil
         if backend == .mps || backend == .all {
             do {
-                mpsScorer = try MPSScorer(batchSize: mpsBatch, inflight: mpsInflightFinal)
+                let gpuBackendSnapshot = gpuBackend
+                makeScorer = { batchSize, inflight in
+                    switch gpuBackendSnapshot {
+                    case .mps:
+                        return try MPSScorer(batchSize: batchSize, inflight: inflight)
+                    case .metal:
+                        return try MetalPyramidScorer(batchSize: batchSize, inflight: inflight)
+                    }
+                }
+                if let makeScorer {
+                    gpuScorer = try makeScorer(mpsBatch, mpsInflightStart)
+                }
             } catch {
                 if backend == .all {
-                    emit(.warning, "Warning: failed to initialize MPS backend (\(error)); falling back to --backend cpu")
+                    emit(.warning, "Warning: failed to initialize GPU backend (\(error)); falling back to --backend cpu")
                     resolvedBackend = .cpu
                 } else {
                     throw error
@@ -150,6 +198,21 @@ enum ExploreRunner {
         }
 
         let resolvedBackendFinal = resolvedBackend
+
+        let mpsWorkerCount: Int = {
+            let maxWorkers = max(1, ProcessInfo.processInfo.activeProcessorCount)
+            if mpsWorkers > 0 {
+                return min(maxWorkers, mpsWorkers)
+            }
+            switch resolvedBackendFinal {
+            case .mps:
+                return max(1, maxWorkers / 2)
+            case .all:
+                return 1
+            case .cpu:
+                return 1
+            }
+        }()
 
         let cpuThreadCount: Int = {
             switch resolvedBackendFinal {
@@ -303,16 +366,21 @@ enum ExploreRunner {
             seedStateTimer = timer
         }
 
+        var signalSources: [DispatchSourceSignal] = []
+        defer { signalSources.forEach { $0.cancel() } }
+
         signal(SIGINT, SIG_IGN)
         signal(SIGTERM, SIG_IGN)
 
         let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: DispatchQueue.global(qos: .utility))
         sigintSource.setEventHandler { stop.requestStop() }
         sigintSource.resume()
+        signalSources.append(sigintSource)
 
         let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: DispatchQueue.global(qos: .utility))
         sigtermSource.setEventHandler { stop.requestStop() }
         sigtermSource.resume()
+        signalSources.append(sigtermSource)
 
         let startNs = DispatchTime.now().uptimeNanoseconds
 
@@ -378,16 +446,29 @@ enum ExploreRunner {
         }
 
         if effectiveDoSubmit, !mpsMarginSpecified, (resolvedBackendFinal == .mps || resolvedBackendFinal == .all) {
-            if let cal = CalibrateMPS.loadIfValid(optLevel: 1) {
-                mpsVerifyMargin = max(0.0, cal.recommendedMargin)
-                emit(.info, "Loaded MPS calibration: mps-margin=\(String(format: "%.6f", mpsVerifyMargin)) q=\(String(format: "%.4f", cal.quantile)) verified=\(cal.verifiedCount)")
-            } else {
-                emit(.warning, "No valid MPS calibration found; run: gobx calibrate-mps (or set --mps-margin explicitly)")
+            switch gpuBackend {
+            case .metal:
+                if let cal = CalibrateMetal.loadIfValid() {
+                    mpsVerifyMargin = max(0.0, cal.recommendedMargin)
+                    mpsScoreShift = max(0.0, cal.recommendedScoreShift)
+                    emit(.info, "Loaded Metal calibration: mps-margin=\(String(format: "%.6f", mpsVerifyMargin)) shift=\(String(format: "%.6f", mpsScoreShift)) q=\(String(format: "%.4f", cal.quantile)) verified=\(cal.verifiedCount)")
+                } else {
+                    emit(.warning, "No valid Metal calibration found; run: gobx calibrate-metal (or set --mps-margin explicitly)")
+                }
+            case .mps:
+                if let cal = CalibrateMPS.loadIfValid(optLevel: 1) {
+                    mpsVerifyMargin = max(0.0, cal.recommendedMargin)
+                    emit(.info, "Loaded MPS calibration: mps-margin=\(String(format: "%.6f", mpsVerifyMargin)) q=\(String(format: "%.4f", cal.quantile)) verified=\(cal.verifiedCount)")
+                } else {
+                    emit(.warning, "No valid MPS calibration found; run: gobx calibrate-mps (or set --mps-margin explicitly)")
+                }
             }
         }
 
         let mpsMarginAutoFinal = mpsMarginAuto && effectiveDoSubmit && (resolvedBackendFinal == .mps || resolvedBackendFinal == .all)
         let mpsMarginTracker = AdaptiveMargin(initial: mpsVerifyMargin, autoEnabled: mpsMarginAutoFinal)
+        let mpsShiftAutoFinal = mpsMarginAutoFinal && (gpuBackend == .metal)
+        let mpsShiftTracker = AdaptiveScoreShift(initial: mpsScoreShift, autoEnabled: mpsShiftAutoFinal)
         if mpsMarginAutoFinal {
             emit(.info, "Adaptive mps-margin enabled: initial=\(String(format: "%.6f", mpsMarginTracker.current()))")
         }
@@ -402,7 +483,8 @@ enum ExploreRunner {
                     printLock: printLock,
                     events: eventLog,
                     stats: stats,
-                    margin: mpsMarginTracker
+                    margin: mpsMarginTracker,
+                    scoreShift: mpsShiftTracker
                 )
             case .cpu:
                 return nil
@@ -526,6 +608,7 @@ enum ExploreRunner {
                     endless: endless,
                     totalTarget: totalTarget,
                     mpsVerifyMargin: mpsMarginTracker,
+                    mpsScoreShift: mpsShiftTracker,
                     minScore: minScore
                 ),
                 stats: stats,
@@ -544,7 +627,7 @@ enum ExploreRunner {
         let submissionForWorkers = submission
         let effectiveDoSubmitForWorkers = effectiveDoSubmit
         let minScoreForWorkers = minScore
-        let mpsScorerBox = mpsScorer.map(UnsafeSendableBox.init)
+        let gpuScorerBox = gpuScorer.map(UnsafeSendableBox.init)
 
         if resolvedBackendFinal == .cpu || resolvedBackendFinal == .all {
             group.enter()
@@ -573,11 +656,13 @@ enum ExploreRunner {
             }
         }
 
+        let makeScorerSnapshot = makeScorer
+        let mpsScoreShiftSnapshot = mpsShiftTracker
         if resolvedBackendFinal == .mps || resolvedBackendFinal == .all {
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 defer { group.leave() }
-                guard let scorer = mpsScorerBox?.value else { return }
+                guard let scorer = gpuScorerBox?.value else { return }
 
                 let manager = ExploreMPSManager(params: .init(
                     resolvedBackend: resolvedBackendFinal,
@@ -585,17 +670,22 @@ enum ExploreRunner {
                     total: total,
                     cpuThreadCount: cpuThreadCount,
                     mpsBatch: mpsBatch,
-                    mpsInflight: mpsInflightFinal,
+                    mpsInflight: mpsInflightStart,
                     mpsReinitIntervalNs: mpsReinitIntervalNs,
                     mpsBatchAuto: mpsBatchAutoFinal,
                     mpsBatchMin: mpsBatchMinFinal,
                     mpsBatchMax: mpsBatchMaxFinal,
                     mpsBatchTuneEverySec: mpsBatchTuneEverySec,
+                    mpsInflightAuto: mpsInflightAutoSnapshot,
+                    mpsInflightMin: mpsInflightMinSnapshot,
+                    mpsInflightMax: mpsInflightMaxSnapshot,
+                    mpsWorkers: mpsWorkerCount,
                     claimSize: claimSizeFinal,
                     allocator: seedAllocatorForWorkers,
                     baseSeed: baseSeedForStride,
                     minScore: minScoreForWorkers,
                     mpsVerifyMargin: mpsMarginTracker,
+                    mpsScoreShift: mpsScoreShiftSnapshot,
                     effectiveDoSubmit: effectiveDoSubmitForWorkers,
                     submission: submissionForWorkers,
                     verifier: candidateVerifier,
@@ -603,9 +693,11 @@ enum ExploreRunner {
                     events: eventLog,
                     stats: stats,
                     bestApprox: bestApprox,
+                    topApproxLimit: topN,
                     topApproxTracker: topApproxTracker,
                     stop: stop,
-                    scorer: scorer
+                    scorer: scorer,
+                    makeScorer: makeScorerSnapshot
                 ))
                 manager.run()
             }
@@ -618,10 +710,15 @@ enum ExploreRunner {
         seedStateTimer?.cancel()
         memGuardTimer?.cancel()
 
-        candidateVerifier?.wait()
-        submission?.waitForPendingSubmissions()
+        let stopRequested = stop.isStopRequested()
+        if stopRequested {
+            submission?.flushJournal()
+        } else {
+            candidateVerifier?.wait()
+            submission?.waitForPendingSubmissions()
+        }
 
-        if topN > 0, resolvedBackendFinal != .cpu {
+        if !stopRequested, topN > 0, resolvedBackendFinal != .cpu {
             let top = topApproxTracker.snapshot()
             if !top.isEmpty {
                 printLock.withLock {

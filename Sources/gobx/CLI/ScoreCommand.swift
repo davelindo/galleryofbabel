@@ -2,13 +2,14 @@ import Foundation
 
 enum ScoreCommand {
     static func run(args: [String]) throws {
-        let usage = "Usage: gobx score <seed> [--backend cpu|mps] [--batch <n>] [--json]"
+        let usage = "Usage: gobx score <seed> [--backend cpu|mps] [--batch <n>] [--gpu-backend mps|metal] [--json]"
         var parser = ArgumentParser(args: args, usage: usage)
         let seed = try parseSeed(try parser.requirePositional("seed"))
 
         var backend: Backend = .cpu
         var batch: Int = 1
         var json = false
+        var gpuBackend: GPUBackend = .metal
 
         while let a = parser.pop() {
             switch a {
@@ -22,6 +23,8 @@ enum ScoreCommand {
                 backend = b
             case "--batch":
                 batch = max(1, try parser.requireInt(for: "--batch"))
+            case "--gpu-backend":
+                gpuBackend = try parser.requireEnum(for: "--gpu-backend", GPUBackend.self)
             default:
                 throw parser.unknown(a)
             }
@@ -39,15 +42,23 @@ enum ScoreCommand {
                 print(r)
             }
         case .mps:
-            let scorer = try MPSScorer(batchSize: max(1, batch))
-            let score = Double(scorer.score(seeds: [seed]).first ?? 0)
+            let score: Double
+            switch gpuBackend {
+            case .mps:
+                let scorer = try MPSScorer(batchSize: max(1, batch))
+                score = Double(scorer.score(seeds: [seed]).first ?? 0)
+            case .metal:
+                let scorer = try MetalPyramidScorer(batchSize: max(1, batch))
+                score = Double(scorer.score(seeds: [seed]).first ?? 0)
+            }
+            let gpuLabel = gpuBackend == .metal ? "metal" : "mps"
             if json {
-                let obj: [String: Any] = ["seed": seed, "score": score, "backend": "mps"]
+                let obj: [String: Any] = ["seed": seed, "score": score, "backend": gpuLabel]
                 let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
                 FileHandle.standardOutput.write(data)
                 FileHandle.standardOutput.write("\n".data(using: .utf8)!)
             } else {
-                print("seed=\(seed) score=\(String(format: "%.6f", score)) backend=mps (approx)")
+                print("seed=\(seed) score=\(String(format: "%.6f", score)) backend=\(gpuLabel) (approx)")
             }
         case .all:
             // guarded above

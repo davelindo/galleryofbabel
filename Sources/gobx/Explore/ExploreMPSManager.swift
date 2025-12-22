@@ -1,6 +1,152 @@
 @preconcurrency import Dispatch
 import Foundation
 
+private struct WelfordStats {
+    var count: UInt64 = 0
+    var mean: Double = 0.0
+    var m2: Double = 0.0
+
+    init(count: UInt64 = 0, mean: Double = 0.0, m2: Double = 0.0) {
+        self.count = count
+        self.mean = mean
+        self.m2 = m2
+    }
+
+    mutating func add(_ value: Double) {
+        count &+= 1
+        let delta = value - mean
+        mean += delta / Double(count)
+        let delta2 = value - mean
+        m2 += delta * delta2
+    }
+
+    mutating func merge(_ other: WelfordStats) {
+        guard other.count > 0 else { return }
+        if count == 0 {
+            self = other
+            return
+        }
+        let total = count &+ other.count
+        let delta = other.mean - mean
+        mean += delta * Double(other.count) / Double(total)
+        m2 += other.m2 + delta * delta * Double(count) * Double(other.count) / Double(total)
+        count = total
+    }
+}
+
+private struct LocalCandidate {
+    let seed: UInt64
+    let score: Float
+    let raw: Float
+}
+
+private struct LocalResult {
+    var sum: Double = 0.0
+    var sumSq: Double = 0.0
+    var bestScore: Float = -Float.infinity
+    var bestSeed: UInt64 = 0
+    var sampleStats = WelfordStats()
+    var candidates: [LocalCandidate] = []
+    var candidateWorst: Float = -Float.infinity
+    var sampleCandidates: [LocalCandidate] = []
+    var sampleWorst: Float = -Float.infinity
+    var topApprox: [TopApproxEntry] = []
+    var topApproxWorst: Float = -Float.infinity
+
+    mutating func considerCandidate(_ candidate: LocalCandidate, limit: Int) {
+        guard limit > 0 else { return }
+        if candidates.count < limit {
+            candidates.append(candidate)
+            if candidates.count == limit {
+                candidateWorst = candidates.map(\.score).min() ?? candidate.score
+            }
+            return
+        }
+        guard candidate.score > candidateWorst else { return }
+        var worstIdx = 0
+        var worstScore = candidates[0].score
+        for i in 1..<candidates.count {
+            let s = candidates[i].score
+            if s < worstScore {
+                worstScore = s
+                worstIdx = i
+            }
+        }
+        candidates[worstIdx] = candidate
+        candidateWorst = candidates.map(\.score).min() ?? candidateWorst
+    }
+
+    mutating func considerTopApprox(seed: UInt64, score: Float, limit: Int) {
+        guard limit > 0 else { return }
+        if topApprox.count < limit {
+            topApprox.append(TopApproxEntry(seed: seed, score: score))
+            if topApprox.count == limit {
+                topApproxWorst = topApprox.map(\.score).min() ?? score
+            }
+            return
+        }
+        guard score > topApproxWorst else { return }
+        var worstIdx = 0
+        var worstScore = topApprox[0].score
+        for i in 1..<topApprox.count {
+            let s = topApprox[i].score
+            if s < worstScore {
+                worstScore = s
+                worstIdx = i
+            }
+        }
+        topApprox[worstIdx] = TopApproxEntry(seed: seed, score: score)
+        topApproxWorst = topApprox.map(\.score).min() ?? topApproxWorst
+    }
+
+    mutating func considerSampleCandidate(_ candidate: LocalCandidate, limit: Int) {
+        guard limit > 0 else { return }
+        if sampleCandidates.count < limit {
+            sampleCandidates.append(candidate)
+            if sampleCandidates.count == limit {
+                sampleWorst = sampleCandidates.map(\.score).min() ?? candidate.score
+            }
+            return
+        }
+        guard candidate.score > sampleWorst else { return }
+        var worstIdx = 0
+        var worstScore = sampleCandidates[0].score
+        for i in 1..<sampleCandidates.count {
+            let s = sampleCandidates[i].score
+            if s < worstScore {
+                worstScore = s
+                worstIdx = i
+            }
+        }
+        sampleCandidates[worstIdx] = candidate
+        sampleWorst = sampleCandidates.map(\.score).min() ?? sampleWorst
+    }
+}
+
+private final class LocalResultsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [LocalResult]
+
+    init(count: Int) {
+        self.results = [LocalResult](repeating: LocalResult(), count: max(0, count))
+    }
+
+    func set(_ index: Int, _ value: LocalResult) {
+        lock.lock()
+        if index >= 0 && index < results.count {
+            results[index] = value
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> [LocalResult] {
+        lock.lock()
+        let out = results
+        lock.unlock()
+        return out
+    }
+}
+
 final class ExploreMPSManager: @unchecked Sendable {
     struct Params {
         let resolvedBackend: Backend
@@ -15,6 +161,10 @@ final class ExploreMPSManager: @unchecked Sendable {
         let mpsBatchMin: Int
         let mpsBatchMax: Int
         let mpsBatchTuneEverySec: Double
+        let mpsInflightAuto: Bool
+        let mpsInflightMin: Int
+        let mpsInflightMax: Int
+        let mpsWorkers: Int
 
         let claimSize: Int
         let allocator: SeedRangeAllocator?
@@ -22,6 +172,7 @@ final class ExploreMPSManager: @unchecked Sendable {
 
         let minScore: Double
         let mpsVerifyMargin: AdaptiveMargin
+        let mpsScoreShift: AdaptiveScoreShift
 
         let effectiveDoSubmit: Bool
         let submission: SubmissionManager?
@@ -31,10 +182,12 @@ final class ExploreMPSManager: @unchecked Sendable {
         let events: ExploreEventLog?
         let stats: ExploreStats
         let bestApprox: ApproxBestTracker
+        let topApproxLimit: Int
         let topApproxTracker: TopApproxTracker
         let stop: StopFlag
 
-        let scorer: MPSScorer
+        let scorer: any GPUScorer
+        let makeScorer: (@Sendable (Int, Int) throws -> any GPUScorer)?
     }
 
     private let p: Params
@@ -65,7 +218,7 @@ final class ExploreMPSManager: @unchecked Sendable {
     }
 
     func run() {
-        var scorer = p.scorer
+        var scorer: any GPUScorer = p.scorer
 
         let allocator = p.allocator
         let useState = (allocator != nil)
@@ -129,7 +282,7 @@ final class ExploreMPSManager: @unchecked Sendable {
     }
 
     private func runSingleStage(
-        scorer: inout MPSScorer,
+        scorer: inout any GPUScorer,
         startSeedForLog: UInt64,
         nextSeed: () -> UInt64?,
         quota: Int?,
@@ -137,13 +290,25 @@ final class ExploreMPSManager: @unchecked Sendable {
         useState: Bool,
         stride: UInt64
     ) {
-        let inflightFinal = max(1, p.mpsInflight)
+        var inflight = max(1, p.mpsInflight)
         var batch = max(1, p.mpsBatch)
         let autoEnabled = p.mpsBatchAuto
         let batchMin = autoEnabled ? max(1, p.mpsBatchMin) : batch
         let batchMax = autoEnabled ? max(batchMin, p.mpsBatchMax) : batch
         let tuneInterval = tuneIntervalNs()
-        let tuneLabel = "MPS autotune"
+        let tuneLabel = "GPU autotune"
+        let inflightTuneInterval: UInt64 = {
+            let maxSafe = UInt64.max / 2
+            return tuneInterval > maxSafe ? UInt64.max : tuneInterval * 2
+        }()
+        let inflightAuto = p.mpsInflightAuto
+        let inflightMin = inflightAuto ? max(1, p.mpsInflightMin) : inflight
+        let inflightMax = inflightAuto ? max(inflightMin, p.mpsInflightMax) : inflight
+        if inflight < inflightMin { inflight = inflightMin }
+        if inflight > inflightMax { inflight = inflightMax }
+        let processingWorkers = max(1, p.mpsWorkers)
+        let parallelChunkTarget = 1024
+        let minParallelCount = 2048
         let autoMarginEnabled = p.mpsVerifyMargin.autoEnabled
         let sampleZ = 1.645
         let sampleSlack = 0.1
@@ -155,14 +320,8 @@ final class ExploreMPSManager: @unchecked Sendable {
         var sampleCount: UInt64 = 0
         var sampleMean = 0.0
         var sampleM2 = 0.0
-
-        func updateSampleStats(_ value: Double) {
-            sampleCount += 1
-            let delta = value - sampleMean
-            sampleMean += delta / Double(sampleCount)
-            let delta2 = value - sampleMean
-            sampleM2 += delta * delta2
-        }
+        let sampleLock = NSLock()
+        let topApproxLimit = max(0, p.topApproxLimit)
 
         func currentSampleGate(baseThr: Double, margin: Double) -> Double? {
             guard autoMarginEnabled, sampleCount >= sampleMinCount else { return nil }
@@ -173,7 +332,10 @@ final class ExploreMPSManager: @unchecked Sendable {
             return max(zGate, bandGate)
         }
 
-        func allowSample(now: UInt64) -> Bool {
+        func allowSample() -> Bool {
+            sampleLock.lock()
+            defer { sampleLock.unlock() }
+            let now = DispatchTime.now().uptimeNanoseconds
             if now &- sampleWindowStartNs >= sampleWindowNs {
                 sampleWindowStartNs = now
                 sampleWindowCount = 0
@@ -183,8 +345,206 @@ final class ExploreMPSManager: @unchecked Sendable {
             return true
         }
 
-        var pending: [MPSScorer.Job] = []
-        pending.reserveCapacity(inflightFinal)
+        func processBatch(
+            seedsBuf: UnsafeBufferPointer<UInt64>,
+            scoresBuf: UnsafeBufferPointer<Float>,
+            count: Int
+        ) {
+            guard count > 0 else { return }
+
+            let scoreShift = Float(p.mpsScoreShift.current())
+            let doSubmit = p.effectiveDoSubmit && p.submission != nil && p.verifier != nil
+            let baseThr = doSubmit ? (p.submission?.effectiveThreshold() ?? 0.0) : 0.0
+            let margin = doSubmit ? p.mpsVerifyMargin.current() : 0.0
+            let gate = Float(baseThr - margin) - scoreShift
+            let sampleGate = (doSubmit && autoMarginEnabled) ? currentSampleGate(baseThr: baseThr, margin: margin).map { $0 - Double(scoreShift) } : nil
+            let sampleEnabled = doSubmit && autoMarginEnabled && sampleGate != nil
+
+            let maxWorkers = max(1, processingWorkers)
+            let suggestedWorkers = (count + parallelChunkTarget - 1) / parallelChunkTarget
+            let workerCount = (count >= minParallelCount && maxWorkers > 1) ? min(maxWorkers, max(1, suggestedWorkers)) : 1
+            let chunkSize = (count + workerCount - 1) / workerCount
+
+            let candidateMax = 4
+            let sampleCandidateMax = 4
+
+            var locals: [LocalResult] = []
+            if workerCount == 1 {
+                var local = LocalResult()
+                local.candidates.reserveCapacity(candidateMax)
+                local.sampleCandidates.reserveCapacity(sampleCandidateMax)
+                local.topApprox.reserveCapacity(min(16, topApproxLimit))
+                for idx in 0..<count {
+                    let scRaw = scoresBuf[idx]
+                    guard scRaw.isFinite else { continue }
+                    let s = seedsBuf[idx]
+                    let sc = scRaw - scoreShift
+                    let d = Double(sc)
+                    local.sum += d
+                    local.sumSq += d * d
+                    if autoMarginEnabled {
+                        local.sampleStats.add(d)
+                    }
+                    if topApproxLimit > 0 {
+                        local.considerTopApprox(seed: s, score: sc, limit: topApproxLimit)
+                    }
+                    if sc > local.bestScore {
+                        local.bestScore = sc
+                        local.bestSeed = s
+                    }
+                    if doSubmit {
+                        if sc >= gate {
+                            local.considerCandidate(LocalCandidate(seed: s, score: sc, raw: scRaw), limit: candidateMax)
+                        } else if sampleEnabled, let sampleGate, d >= sampleGate {
+                            local.considerSampleCandidate(LocalCandidate(seed: s, score: sc, raw: scRaw), limit: sampleCandidateMax)
+                        }
+                    }
+                }
+                locals = [local]
+            } else {
+                let seedsBox = UnsafeSendableBox(seedsBuf)
+                let scoresBox = UnsafeSendableBox(scoresBuf)
+                let resultsBox = LocalResultsBox(count: workerCount)
+                DispatchQueue.concurrentPerform(iterations: workerCount) { workerIdx in
+                    let start = workerIdx * chunkSize
+                    let end = min(start + chunkSize, count)
+                    if start >= end { return }
+                    let seeds = seedsBox.value
+                    let scores = scoresBox.value
+                    var local = LocalResult()
+                    local.candidates.reserveCapacity(candidateMax)
+                    local.sampleCandidates.reserveCapacity(sampleCandidateMax)
+                    local.topApprox.reserveCapacity(min(16, topApproxLimit))
+                    for idx in start..<end {
+                        let scRaw = scores[idx]
+                        guard scRaw.isFinite else { continue }
+                        let s = seeds[idx]
+                        let sc = scRaw - scoreShift
+                        let d = Double(sc)
+                        local.sum += d
+                        local.sumSq += d * d
+                        if autoMarginEnabled {
+                            local.sampleStats.add(d)
+                        }
+                        if topApproxLimit > 0 {
+                            local.considerTopApprox(seed: s, score: sc, limit: topApproxLimit)
+                        }
+                        if sc > local.bestScore {
+                            local.bestScore = sc
+                            local.bestSeed = s
+                        }
+                        if doSubmit {
+                            if sc >= gate {
+                                local.considerCandidate(LocalCandidate(seed: s, score: sc, raw: scRaw), limit: candidateMax)
+                            } else if sampleEnabled, let sampleGate, d >= sampleGate {
+                                local.considerSampleCandidate(LocalCandidate(seed: s, score: sc, raw: scRaw), limit: sampleCandidateMax)
+                            }
+                        }
+                    }
+                    resultsBox.set(workerIdx, local)
+                }
+                locals = resultsBox.snapshot()
+            }
+
+            var sum = 0.0
+            var sumSq = 0.0
+            var localBest: Float = -Float.infinity
+            var localBestSeed: UInt64 = 0
+            var mergedSample = WelfordStats(count: sampleCount, mean: sampleMean, m2: sampleM2)
+            var bestCandidates: [LocalCandidate] = []
+            var bestSamples: [LocalCandidate] = []
+
+            for local in locals {
+                sum += local.sum
+                sumSq += local.sumSq
+                if local.bestScore > localBest {
+                    localBest = local.bestScore
+                    localBestSeed = local.bestSeed
+                }
+                if autoMarginEnabled {
+                    mergedSample.merge(local.sampleStats)
+                }
+                if doSubmit {
+                    for c in local.candidates {
+                        if bestCandidates.count < candidateMax {
+                            bestCandidates.append(c)
+                        } else {
+                            var worstIdx = 0
+                            var worstScore = bestCandidates[0].score
+                            for i in 1..<bestCandidates.count {
+                                let s = bestCandidates[i].score
+                                if s < worstScore {
+                                    worstScore = s
+                                    worstIdx = i
+                                }
+                            }
+                            if c.score > worstScore {
+                                bestCandidates[worstIdx] = c
+                            }
+                        }
+                    }
+                    for s in local.sampleCandidates {
+                        if bestSamples.count < sampleCandidateMax {
+                            bestSamples.append(s)
+                        } else {
+                            var worstIdx = 0
+                            var worstScore = bestSamples[0].score
+                            for i in 1..<bestSamples.count {
+                                let v = bestSamples[i].score
+                                if v < worstScore {
+                                    worstScore = v
+                                    worstIdx = i
+                                }
+                            }
+                            if s.score > worstScore {
+                                bestSamples[worstIdx] = s
+                            }
+                        }
+                    }
+                }
+                if topApproxLimit > 0, !local.topApprox.isEmpty {
+                    for entry in local.topApprox {
+                        p.topApproxTracker.update(seed: entry.seed, score: entry.score)
+                    }
+                }
+            }
+
+            if autoMarginEnabled {
+                sampleCount = mergedSample.count
+                sampleMean = mergedSample.mean
+                sampleM2 = mergedSample.m2
+            }
+
+            p.stats.addMPS(count: count, scoreSum: sum, scoreSumSq: sumSq)
+            if localBest.isFinite {
+                _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
+            }
+
+            if doSubmit, let verifier = p.verifier, !bestCandidates.isEmpty {
+                bestCandidates.sort { $0.score > $1.score }
+                if bestCandidates.count > candidateMax {
+                    bestCandidates.removeSubrange(candidateMax..<bestCandidates.count)
+                }
+                for c in bestCandidates {
+                    verifier.enqueue(seed: c.seed, source: "mps", mpsScore: c.score, mpsScoreRaw: c.raw)
+                }
+            }
+
+            if sampleEnabled, let verifier = p.verifier, !bestSamples.isEmpty {
+                bestSamples.sort { $0.score > $1.score }
+                if bestSamples.count > sampleCandidateMax {
+                    bestSamples.removeSubrange(sampleCandidateMax..<bestSamples.count)
+                }
+                for s in bestSamples {
+                    if allowSample() {
+                        verifier.enqueue(seed: s.seed, source: "mps-sample", mpsScore: s.score, mpsScoreRaw: s.raw)
+                    }
+                }
+            }
+        }
+
+        var pending: [GPUJob] = []
+        pending.reserveCapacity(inflight)
 
         var enqueued = 0
         var completed = 0
@@ -199,8 +559,6 @@ final class ExploreMPSManager: @unchecked Sendable {
         var bestTuneBatch = batch
         var tuneDirection = 1
         var tuneDirectionChanges = 0
-        var pendingTuneBatch: Int? = nil
-        var pendingTuneReason: String? = nil
         var tuneSettled = false
         let tuneImproveFactor = 1.005
         let tuneDropFactor = 0.98
@@ -210,6 +568,19 @@ final class ExploreMPSManager: @unchecked Sendable {
         var tuneLevel = 0
         let tuneWarmupIntervals = 1
         var tuneWarmupRemaining = autoEnabled ? tuneWarmupIntervals : 0
+        var pendingTune: (batch: Int, inflight: Int, reason: String)? = nil
+        var inflightTuneSettled = !inflightAuto || inflightMin == inflightMax
+        var inflightLastTuneNs = lastReinitNs
+        var inflightLastCompleted = 0
+        var inflightLastRate: Double? = nil
+        var inflightBestRate: Double? = nil
+        var inflightBest = inflight
+        var inflightDirection = 1
+        var inflightDirectionChanges = 0
+        let inflightImproveFactor = 1.005
+        let inflightDropFactor = 0.98
+        let inflightWarmupIntervals = 1
+        var inflightWarmupRemaining = inflightAuto ? inflightWarmupIntervals : 0
 
         func currentStep() -> (up: Double, down: Double) {
             tuneStepLevels[tuneLevel]
@@ -227,77 +598,87 @@ final class ExploreMPSManager: @unchecked Sendable {
             }
         }
 
-        func rebuildScorer(newBatch: Int, reason: String) {
-            guard newBatch > 0, newBatch != batch else { return }
-            emit(.info, "Reinitializing MPS scorer (\(reason), batch=\(newBatch))…")
+        func rebuildScorer(newBatch: Int, newInflight: Int, reason: String) {
+            guard newBatch > 0, newInflight > 0 else { return }
+            guard newBatch != batch || newInflight != inflight else { return }
+            emit(.info, "Reinitializing GPU scorer (\(reason), batch=\(newBatch) inflight=\(newInflight))…")
             do {
-                scorer = try MPSScorer(batchSize: newBatch, inflight: inflightFinal)
+                guard let makeScorer = p.makeScorer else { return }
+                scorer = try makeScorer(newBatch, newInflight)
                 batch = newBatch
+                inflight = newInflight
                 seeds = [UInt64](repeating: 0, count: batch)
+                pending = []
+                pending.reserveCapacity(inflight)
                 tuneWarmupRemaining = tuneWarmupIntervals
+                inflightWarmupRemaining = inflightWarmupIntervals
                 lastReinitNs = DispatchTime.now().uptimeNanoseconds
             } catch {
-                emit(.warning, "Warning: MPS reinit failed: \(error)")
+                emit(.warning, "Warning: GPU reinit failed: \(error)")
             }
         }
 
         if autoEnabled {
             let aligned = min(batchMax, max(batchMin, alignedBatch(batch, align: currentAlign())))
             if aligned != batch {
-                rebuildScorer(newBatch: aligned, reason: "autotune-init")
+                rebuildScorer(newBatch: aligned, newInflight: inflight, reason: "autotune-init")
             }
         }
 
-        func scheduleTune(next: Int, reason: String) {
-            pendingTuneBatch = next
-            pendingTuneReason = reason
+        func scheduleTune(batch nextBatch: Int, inflight nextInflight: Int, reason: String) {
+            pendingTune = (batch: nextBatch, inflight: nextInflight, reason: reason)
         }
 
         func settle(rate: Double) {
             tuneSettled = true
             let bestRate = bestTuneRate ?? rate
             if bestTuneBatch != batch {
-                scheduleTune(next: bestTuneBatch, reason: String(format: "autotune settle best=%.0f/s", bestRate))
+                scheduleTune(batch: bestTuneBatch, inflight: inflight, reason: String(format: "autotune settle best=%.0f/s", bestRate))
             } else {
                 emit(.info, "\(tuneLabel) settled: batch=\(batch) rate=\(String(format: "%.0f", bestRate))/s")
             }
         }
 
         func applyPendingTune(now: UInt64) {
-            guard let next = pendingTuneBatch, pending.isEmpty else { return }
-            let reason = pendingTuneReason ?? "autotune"
-            rebuildScorer(newBatch: next, reason: reason)
-            pendingTuneBatch = nil
-            pendingTuneReason = nil
+            guard let tune = pendingTune, pending.isEmpty else { return }
+            rebuildScorer(newBatch: tune.batch, newInflight: tune.inflight, reason: tune.reason)
+            pendingTune = nil
             lastTuneNs = now
             lastTuneCompleted = completed
+            inflightLastTuneNs = now
+            inflightLastCompleted = completed
         }
 
         if useState {
-            emit(.info, "MPS start: \(startSeedForLog) claim=\(claimCount) batch=\(batch) inflight=\(scorer.inflight) count=\(p.endless ? "∞" : "\(p.total)")")
+            emit(.info, "GPU start: \(startSeedForLog) claim=\(claimCount) batch=\(batch) inflight=\(inflight) count=\(p.endless ? "∞" : "\(p.total)")")
         } else {
-            emit(.info, "MPS start: \(startSeedForLog) stride=\(stride) batch=\(batch) inflight=\(scorer.inflight) count=\(quota.map(String.init) ?? "∞")")
+            emit(.info, "GPU start: \(startSeedForLog) stride=\(stride) batch=\(batch) inflight=\(inflight) count=\(quota.map(String.init) ?? "∞")")
         }
         if autoEnabled {
             emit(.info, "\(tuneLabel): batch=\(batch) min=\(batchMin) max=\(batchMax) interval=\(String(format: "%.2f", Double(tuneInterval) / 1e9))s")
+        }
+        if inflightAuto && !inflightTuneSettled {
+            emit(.info, "Inflight autotune: inflight=\(inflight) min=\(inflightMin) max=\(inflightMax) interval=\(String(format: "%.2f", Double(inflightTuneInterval) / 1e9))s")
         }
 
         func maybeReinit() {
             guard p.mpsReinitIntervalNs > 0 else { return }
             reinitCheck = (reinitCheck + 1) & 127
             guard reinitCheck == 0 else { return }
-            guard pendingTuneBatch == nil else { return }
+            guard pendingTune == nil else { return }
             guard pending.isEmpty else { return }
             let now = DispatchTime.now().uptimeNanoseconds
             if now &- lastReinitNs < p.mpsReinitIntervalNs { return }
 
-            emit(.info, "Reinitializing MPS scorer…")
+            emit(.info, "Reinitializing GPU scorer…")
 
             do {
-                scorer = try MPSScorer(batchSize: batch, inflight: inflightFinal)
+                guard let makeScorer = p.makeScorer else { return }
+                scorer = try makeScorer(batch, inflight)
                 tuneWarmupRemaining = tuneWarmupIntervals
+                inflightWarmupRemaining = inflightWarmupIntervals
             } catch {
-                emit(.warning, "Warning: MPS reinit failed: \(error)")
+                emit(.warning, "Warning: GPU reinit failed: \(error)")
                 p.stop.requestStop()
             }
             lastReinitNs = now
@@ -306,7 +687,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         func maybeTune(now: UInt64) {
             guard autoEnabled else { return }
             guard !tuneSettled else { return }
-            guard pendingTuneBatch == nil else { return }
+            guard pendingTune == nil else { return }
             let elapsedNs = now &- lastTuneNs
             guard elapsedNs >= tuneInterval else { return }
 
@@ -367,7 +748,66 @@ final class ExploreMPSManager: @unchecked Sendable {
                 }
                 next = retry
             }
-            scheduleTune(next: next, reason: String(format: "autotune rate=%.0f/s", rate))
+            scheduleTune(batch: next, inflight: inflight, reason: String(format: "autotune rate=%.0f/s", rate))
+        }
+
+        func maybeTuneInflight(now: UInt64) {
+            guard inflightAuto else { return }
+            guard tuneSettled else { return }
+            guard !inflightTuneSettled else { return }
+            guard pendingTune == nil else { return }
+            let elapsedNs = now &- inflightLastTuneNs
+            guard elapsedNs >= inflightTuneInterval else { return }
+
+            if inflightWarmupRemaining > 0 {
+                inflightLastTuneNs = now
+                inflightLastCompleted = completed
+                inflightWarmupRemaining -= 1
+                return
+            }
+
+            let completedDelta = completed - inflightLastCompleted
+            let dt = Double(elapsedNs) / 1e9
+            inflightLastTuneNs = now
+            inflightLastCompleted = completed
+            guard dt > 0, completedDelta > 0 else { return }
+
+            let rate = Double(completedDelta) / dt
+            if inflightBestRate == nil || rate > (inflightBestRate ?? 0) * inflightImproveFactor {
+                inflightBestRate = rate
+                inflightBest = inflight
+            }
+            if let last = inflightLastRate, rate < last * inflightDropFactor {
+                inflightDirection *= -1
+                inflightDirectionChanges += 1
+            }
+            inflightLastRate = rate
+
+            if inflightDirectionChanges >= 2 {
+                inflightTuneSettled = true
+                let bestRate = inflightBestRate ?? rate
+                if inflightBest != inflight {
+                    scheduleTune(batch: batch, inflight: inflightBest, reason: String(format: "autotune inflight settle best=%.0f/s", bestRate))
+                } else {
+                    emit(.info, "Inflight autotune settled: inflight=\(inflight) rate=\(String(format: "%.0f", bestRate))/s")
+                }
+                return
+            }
+
+            var next = inflight + inflightDirection
+            if next < inflightMin || next > inflightMax {
+                inflightDirection *= -1
+                inflightDirectionChanges += 1
+                next = inflight + inflightDirection
+            }
+            next = min(inflightMax, max(inflightMin, next))
+            if next == inflight {
+                inflightTuneSettled = true
+                let bestRate = inflightBestRate ?? rate
+                emit(.info, "Inflight autotune settled: inflight=\(inflight) rate=\(String(format: "%.0f", bestRate))/s")
+                return
+            }
+            scheduleTune(batch: batch, inflight: next, reason: String(format: "autotune inflight rate=%.0f/s", rate))
         }
 
         func enqueueNext() -> Bool {
@@ -401,74 +841,7 @@ final class ExploreMPSManager: @unchecked Sendable {
             let job = pending.removeFirst()
             do {
                 try scorer.withCompletedJob(job) { seedsBuf, scoresBuf in
-                    var sum = 0.0
-                    var sumSq = 0.0
-                    var localBest: Float = -Float.infinity
-                    var localBestSeed: UInt64 = 0
-
-                    if p.effectiveDoSubmit, let sub = p.submission, let verifier = p.verifier {
-                        let baseThr = sub.effectiveThreshold()
-                        let margin = p.mpsVerifyMargin.current()
-                        let gate = Float(baseThr - margin)
-                        let sampleGate = currentSampleGate(baseThr: baseThr, margin: margin)
-                        let nowNs = DispatchTime.now().uptimeNanoseconds
-                        var candidates: [(seed: UInt64, score: Float)] = []
-                        let kMax = 4
-                        candidates.reserveCapacity(kMax)
-
-                        for idx in 0..<job.count {
-                            let sc = scoresBuf[idx]
-                            guard sc.isFinite else { continue }
-                            let s = seedsBuf[idx]
-                            let d = Double(sc)
-                            sum += d
-                            sumSq += d * d
-                            if autoMarginEnabled {
-                                updateSampleStats(d)
-                            }
-                            p.topApproxTracker.update(seed: s, score: sc)
-                            if sc > localBest {
-                                localBest = sc
-                                localBestSeed = s
-                            }
-                            if sc >= gate {
-                                candidates.append((seed: s, score: sc))
-                            } else if let sampleGate, autoMarginEnabled, d >= sampleGate, allowSample(now: nowNs) {
-                                verifier.enqueue(seed: s, source: "mps-sample", mpsScore: sc)
-                            }
-                        }
-                        p.stats.addMPS(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
-                        if localBest.isFinite {
-                            _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
-                        }
-
-                        if !candidates.isEmpty {
-                            candidates.sort { $0.score > $1.score }
-                            if candidates.count > kMax { candidates.removeSubrange(kMax..<candidates.count) }
-                            for c in candidates {
-                                verifier.enqueue(seed: c.seed, source: "mps", mpsScore: c.score)
-                            }
-                        }
-                        return
-                    }
-
-                    for idx in 0..<job.count {
-                        let sc = scoresBuf[idx]
-                        guard sc.isFinite else { continue }
-                        let s = seedsBuf[idx]
-                        let d = Double(sc)
-                        sum += d
-                        sumSq += d * d
-                        p.topApproxTracker.update(seed: s, score: sc)
-                        if sc > localBest {
-                            localBest = sc
-                            localBestSeed = s
-                        }
-                    }
-                    p.stats.addMPS(count: job.count, scoreSum: sum, scoreSumSq: sumSq)
-                    if localBest.isFinite {
-                        _ = p.bestApprox.updateIfBetter(seed: localBestSeed, score: localBest)
-                    }
+                    processBatch(seedsBuf: seedsBuf, scoresBuf: scoresBuf, count: job.count)
                 }
             } catch {
                 emit(.warning, "Warning: MPS run error: \(error)")
@@ -483,9 +856,10 @@ final class ExploreMPSManager: @unchecked Sendable {
             applyPendingTune(now: now)
             maybeReinit()
             maybeTune(now: now)
+            maybeTuneInflight(now: now)
 
-            if pendingTuneBatch == nil {
-                while pending.count < inflightFinal {
+            if pendingTune == nil {
+                while pending.count < inflight {
                     if !enqueueNext() { break }
                 }
             }

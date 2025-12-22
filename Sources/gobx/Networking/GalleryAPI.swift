@@ -62,6 +62,22 @@ struct SubmissionResponse: Codable {
     let accepted: Bool
     let rank: Int?
     let message: String?
+    let statusCode: Int?
+}
+
+extension SubmissionResponse {
+    var isRateLimited: Bool {
+        if let statusCode { return statusCode == 429 }
+        guard let message else { return false }
+        let lower = message.lowercased()
+        return lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests")
+    }
+
+    var isRetryableServerError: Bool {
+        if let statusCode { return statusCode >= 500 }
+        guard let message else { return false }
+        return message.contains("HTTP 5")
+    }
 }
 
 func submitScore(seed: UInt64, score: Double, config: AppConfig) async -> SubmissionResponse? {
@@ -89,13 +105,28 @@ func submitScore(seed: UInt64, score: Double, config: AppConfig) async -> Submis
     guard let res = await runHTTP(url: url, method: "POST", jsonBody: bodyData, timeoutSec: 15) else { return nil }
 
     if let decoded = try? JSONDecoder().decode(SubmissionResponse.self, from: res.body) {
-        return decoded
+        return SubmissionResponse(
+            accepted: decoded.accepted,
+            rank: decoded.rank,
+            message: decoded.message,
+            statusCode: res.statusCode
+        )
     }
     let msg = String(data: res.body, encoding: .utf8) ?? ""
     if res.statusCode != 200 {
-        return SubmissionResponse(accepted: false, rank: nil, message: "HTTP \(res.statusCode): \(msg)")
+        return SubmissionResponse(
+            accepted: false,
+            rank: nil,
+            message: "HTTP \(res.statusCode): \(msg)",
+            statusCode: res.statusCode
+        )
     }
-    return SubmissionResponse(accepted: false, rank: nil, message: "Decode error: \(msg)")
+    return SubmissionResponse(
+        accepted: false,
+        rank: nil,
+        message: "Decode error: \(msg)",
+        statusCode: res.statusCode
+    )
 }
 
 struct TopResponse: Decodable {

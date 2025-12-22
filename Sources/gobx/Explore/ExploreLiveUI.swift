@@ -8,6 +8,7 @@ final class ExploreLiveUI: @unchecked Sendable {
         let endless: Bool
         let totalTarget: Int?
         let mpsVerifyMargin: AdaptiveMargin
+        let mpsScoreShift: AdaptiveScoreShift
         let minScore: Double
     }
 
@@ -26,6 +27,7 @@ final class ExploreLiveUI: @unchecked Sendable {
     private var startNs: UInt64 = 0
     private var lastSnap: ExploreStats.Snapshot
     private var lastNs: UInt64 = 0
+    private var lastSubmitSnap: SubmissionManager.StatsSnapshot? = nil
     private var totalRateHistory: [Double] = []
     private var cpuRateHistory: [Double] = []
     private var mpsRateHistory: [Double] = []
@@ -108,6 +110,7 @@ final class ExploreLiveUI: @unchecked Sendable {
         let topSnap = submission?.stateSnapshot()
         let thr = submission?.effectiveThreshold() ?? ctx.minScore
         let top500 = topSnap?.top500Threshold ?? .nan
+        let submitSnap = submission?.statsSnapshot()
 
         let bestSnap = best.snapshot()
         let approxSnap = bestApprox.snapshot()
@@ -137,7 +140,8 @@ final class ExploreLiveUI: @unchecked Sendable {
 
         let cpuEta = etaString(rate: cpuRate, meanStd: cpuMeanStd, threshold: thr)
         let margin = ctx.mpsVerifyMargin.current()
-        let approxGate = thr - margin
+        let shift = ctx.mpsScoreShift.current()
+        let approxGate = thr - margin - shift
         let mpsEta = etaString(rate: mpsRate, meanStd: mpsMeanStd, threshold: approxGate)
 
         var lines: [String] = []
@@ -158,8 +162,13 @@ final class ExploreLiveUI: @unchecked Sendable {
         if top500.isFinite {
             thrLine += "  top500=\(fmt(top500))"
         }
-        if margin > 0, ctx.backend == .mps || ctx.backend == .all {
-            thrLine += "  mps-margin=\(fmt(margin))"
+        if (ctx.backend == .mps || ctx.backend == .all) && (margin > 0 || shift > 0) {
+            if margin > 0 {
+                thrLine += "  mps-margin=\(fmt(margin))"
+            }
+            if shift > 0 {
+                thrLine += "  mps-shift=\(fmt(shift))"
+            }
         }
         lines.append(truncateANSI("\(ANSI.gray)\(thrLine)\(ANSI.reset)", cols: size.cols))
 
@@ -196,7 +205,19 @@ final class ExploreLiveUI: @unchecked Sendable {
         lines.append("")
 
         if let submission {
-            lines.append("\(ANSI.bold)Accepted (latest)\(ANSI.reset)")
+            var header = "Accepted (latest)"
+            if let submitSnap {
+                let prior = lastSubmitSnap
+                let submitDelta = prior.map { Double(submitSnap.submitAttempts &- $0.submitAttempts) } ?? 0.0
+                let submitRate = dt > 0 ? submitDelta / dt : 0.0
+                var stats = "acc=\(fmtCount(submitSnap.acceptedCount)) rej=\(fmtCount(submitSnap.rejectedCount)) rate=\(fmtRate(submitRate))/s"
+                if submitSnap.queuedCount > 0 {
+                    stats += " queued=\(fmtCount(UInt64(submitSnap.queuedCount)))"
+                }
+                header += " (\(stats))"
+                lastSubmitSnap = submitSnap
+            }
+            lines.append("\(ANSI.bold)\(header)\(ANSI.reset)")
             let accepted = submission.acceptedSnapshot(limit: 5)
             if accepted.isEmpty {
                 lines.append("\(ANSI.gray)(none yet)\(ANSI.reset)")

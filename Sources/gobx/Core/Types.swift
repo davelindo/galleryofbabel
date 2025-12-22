@@ -41,3 +41,8 @@ enum Backend: String {
     case mps
     case all
 }
+
+enum GPUBackend: String {
+    case mps
+    case metal
+}

@@ -9,6 +9,8 @@ struct ExploreOptions {
     var batch: Int = 64
     var backend: Backend = .cpu
     var backendSpecified: Bool = false
+    var gpuBackend: GPUBackend = .metal
+    var gpuBackendSpecified: Bool = false
     var topN: Int? = nil
 
     var doSubmit: Bool = false
@@ -37,6 +39,12 @@ struct ExploreOptions {
     var mpsMarginAuto: Bool = false
     var mpsMarginAutoSpecified: Bool = false
     var mpsInflight: Int = 2
+    var mpsWorkers: Int = 0
+    var mpsInflightAuto: Bool = false
+    var mpsInflightMin: Int = 0
+    var mpsInflightMax: Int = 0
+    var mpsInflightMinSpecified: Bool = false
+    var mpsInflightMaxSpecified: Bool = false
     var mpsReinitEverySec: Double = 0.0
     var mpsBatchAuto: Bool = false
     var mpsBatchAutoSpecified: Bool = false
@@ -71,6 +79,9 @@ extension ExploreOptions {
             case "--backend":
                 o.backend = try parser.requireEnum(for: "--backend", Backend.self)
                 o.backendSpecified = true
+            case "--gpu-backend":
+                o.gpuBackend = try parser.requireEnum(for: "--gpu-backend", GPUBackend.self)
+                o.gpuBackendSpecified = true
             case "--top":
                 o.topN = try parser.requireInt(for: "--top")
             case "--submit":
@@ -118,6 +129,16 @@ extension ExploreOptions {
                 o.mpsMarginAutoSpecified = true
             case "--mps-inflight":
                 o.mpsInflight = max(1, try parser.requireInt(for: "--mps-inflight"))
+            case "--mps-inflight-auto":
+                o.mpsInflightAuto = true
+            case "--mps-inflight-min":
+                o.mpsInflightMin = max(1, try parser.requireInt(for: "--mps-inflight-min"))
+                o.mpsInflightMinSpecified = true
+            case "--mps-inflight-max":
+                o.mpsInflightMax = max(1, try parser.requireInt(for: "--mps-inflight-max"))
+                o.mpsInflightMaxSpecified = true
+            case "--mps-workers":
+                o.mpsWorkers = try parser.requireInt(for: "--mps-workers")
             case "--mps-reinit-every":
                 o.mpsReinitEverySec = max(0.0, try parser.requireDouble(for: "--mps-reinit-every"))
             case "--mps-batch-auto":

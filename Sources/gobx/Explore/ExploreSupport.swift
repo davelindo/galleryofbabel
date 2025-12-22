@@ -267,6 +267,12 @@ final class SubmissionState: @unchecked Sendable {
         return true
     }
 
+    func markAttempted(seed: UInt64) {
+        lock.lock()
+        attemptedSeeds.insert(seed)
+        lock.unlock()
+    }
+
     func markAccepted(seed: UInt64) {
         lock.lock()
         knownSeeds.insert(seed)
@@ -287,6 +293,78 @@ final class SubmissionState: @unchecked Sendable {
     }
 }
 
+actor SubmissionRateLimiter {
+    private var timestamps: [TimeInterval] = []
+    private var backoffUntil: TimeInterval = 0.0
+    private var backoffStep: Int = 0
+    private let optimistic: Bool
+
+    private let maxPerWindow: Int
+    private let windowSec: TimeInterval
+    private let baseBackoffSec: TimeInterval
+    private let maxBackoffSec: TimeInterval
+    private let jitterFrac: Double
+
+    init(
+        maxPerWindow: Int = 10,
+        windowSec: TimeInterval = 60.0,
+        baseBackoffSec: TimeInterval = 1.0,
+        maxBackoffSec: TimeInterval = 60.0,
+        jitterFrac: Double = 0.15,
+        optimistic: Bool = true
+    ) {
+        self.maxPerWindow = max(1, maxPerWindow)
+        self.windowSec = max(1.0, windowSec)
+        self.baseBackoffSec = max(0.1, baseBackoffSec)
+        self.maxBackoffSec = max(self.baseBackoffSec, maxBackoffSec)
+        self.jitterFrac = max(0.0, jitterFrac)
+        self.optimistic = optimistic
+    }
+
+    func acquire() async {
+        while true {
+            let now = Date().timeIntervalSinceReferenceDate
+
+            var wait: TimeInterval = 0.0
+            if !optimistic {
+                timestamps.removeAll { now - $0 >= windowSec }
+                if timestamps.count >= maxPerWindow, let oldest = timestamps.first {
+                    wait = max(wait, oldest + windowSec - now)
+                }
+            }
+            if backoffUntil > now {
+                wait = max(wait, backoffUntil - now)
+            }
+
+            if wait <= 0 {
+                if !optimistic {
+                    timestamps.append(now)
+                }
+                return
+            }
+
+            let ns = UInt64((wait * 1_000_000_000).rounded(.up))
+            try? await Task.sleep(nanoseconds: ns)
+        }
+    }
+
+    func recordRateLimit() -> TimeInterval {
+        let now = Date().timeIntervalSinceReferenceDate
+        backoffStep = min(backoffStep + 1, 10)
+        let raw = baseBackoffSec * pow(2.0, Double(backoffStep - 1))
+        let delay = min(maxBackoffSec, raw)
+        let jitter = delay * jitterFrac * Double.random(in: -1.0...1.0)
+        let finalDelay = max(0.0, delay + jitter)
+        backoffUntil = max(backoffUntil, now + finalDelay)
+        return finalDelay
+    }
+
+    func recordSuccess() {
+        backoffStep = 0
+        backoffUntil = 0.0
+    }
+}
+
 final class SubmissionManager: @unchecked Sendable {
     struct AcceptedSeed: Sendable {
         let time: Date
@@ -296,6 +374,35 @@ final class SubmissionManager: @unchecked Sendable {
         let source: String?
     }
 
+    private struct SubmissionTask: Sendable {
+        let seed: UInt64
+        let score: Double
+        let source: String?
+        let seq: UInt64
+    }
+
+    private struct SubmissionJournal: Codable {
+        let version: Int
+        let updatedAt: Date
+        let entries: [SubmissionJournalEntry]
+    }
+
+    private struct SubmissionJournalEntry: Codable {
+        let seed: UInt64
+        let score: Double
+        let source: String?
+        let seq: UInt64
+    }
+
+    struct StatsSnapshot: Sendable {
+        let submitAttempts: UInt64
+        let acceptedCount: UInt64
+        let rejectedCount: UInt64
+        let rateLimitedCount: UInt64
+        let failedCount: UInt64
+        let queuedCount: Int
+    }
+
     private let config: AppConfig
     private let state: SubmissionState
     private let userMinScore: Double
@@ -303,7 +410,29 @@ final class SubmissionManager: @unchecked Sendable {
     private let printLock: NSLock
     private let events: ExploreEventLog?
     private let queue = DispatchQueue(label: "gobx.submit", qos: .utility)
+    private let queueKey = DispatchSpecificKey<UInt8>()
     private let pending = DispatchGroup()
+    private let limiter = SubmissionRateLimiter(optimistic: true)
+    private let maxRetries = 8
+    private let retryBaseSec: TimeInterval = 1.0
+    private let retryMaxSec: TimeInterval = 30.0
+    private let retryJitter: Double = 0.2
+    private let statsLock = NSLock()
+    private var submitAttempts: UInt64 = 0
+    private var acceptedCount: UInt64 = 0
+    private var rejectedCount: UInt64 = 0
+    private var rateLimitedCount: UInt64 = 0
+    private var failedCount: UInt64 = 0
+    private var queuedCount: Int = 0
+    private var submitSeq: UInt64 = 0
+    private var submitQueue: [SubmissionTask] = []
+    private var isSubmitting = false
+    private var activeTask: SubmissionTask? = nil
+    private let journalURL: URL = GobxPaths.submissionQueueURL
+    private var journalLoaded = false
+    private var journalDeferred = false
+    private var journalWritePending = false
+    private let journalWriteDelay: TimeInterval = 1.0
     private let acceptedLock = NSLock()
     private var accepted: [AcceptedSeed] = []
     private let acceptedCapacity = 20
@@ -322,6 +451,9 @@ final class SubmissionManager: @unchecked Sendable {
         self.topUniqueUsers = topUniqueUsers
         self.printLock = printLock
         self.events = events
+        queue.setSpecific(key: queueKey, value: 1)
+        submitQueue.reserveCapacity(64)
+        maybeLoadSubmissionJournal()
     }
 
     private func emit(_ kind: ExploreEventKind, _ message: String) {
@@ -330,6 +462,14 @@ final class SubmissionManager: @unchecked Sendable {
         } else {
             printLock.withLock { print(message) }
         }
+    }
+
+    private func retryDelay(attempt: Int) -> TimeInterval {
+        let step = max(1, attempt)
+        let raw = retryBaseSec * pow(2.0, Double(step - 1))
+        let delay = min(retryMaxSec, raw)
+        let jitter = delay * retryJitter * Double.random(in: -1.0...1.0)
+        return max(0.0, delay + jitter)
     }
 
     func effectiveThreshold() -> Double {
@@ -348,11 +488,64 @@ final class SubmissionManager: @unchecked Sendable {
         return out
     }
 
+    func statsSnapshot() -> StatsSnapshot {
+        statsLock.lock()
+        let snap = StatsSnapshot(
+            submitAttempts: submitAttempts,
+            acceptedCount: acceptedCount,
+            rejectedCount: rejectedCount,
+            rateLimitedCount: rateLimitedCount,
+            failedCount: failedCount,
+            queuedCount: queuedCount
+        )
+        statsLock.unlock()
+        return snap
+    }
+
+    private func setQueuedCount(_ count: Int) {
+        statsLock.lock()
+        queuedCount = max(0, count)
+        statsLock.unlock()
+    }
+
+    private func recordSubmitAttempt() {
+        statsLock.lock()
+        submitAttempts &+= 1
+        statsLock.unlock()
+    }
+
+    private func recordAccepted() {
+        statsLock.lock()
+        acceptedCount &+= 1
+        statsLock.unlock()
+    }
+
+    private func recordRejected() {
+        statsLock.lock()
+        rejectedCount &+= 1
+        statsLock.unlock()
+    }
+
+    private func recordRateLimited() {
+        statsLock.lock()
+        rateLimitedCount &+= 1
+        statsLock.unlock()
+    }
+
+    private func recordFailed() {
+        statsLock.lock()
+        failedCount &+= 1
+        statsLock.unlock()
+    }
+
     func enqueueRefreshTop500(limit: Int = 500, reason: String? = nil) {
         queue.async {
             Task {
                 guard let top = await fetchTop(limit: limit, config: self.config, uniqueUsers: self.topUniqueUsers) else { return }
                 self.state.mergeTop(top)
+                self.queue.async {
+                    self.maybeLoadSubmissionJournal()
+                }
                 let snap = self.state.snapshot()
                 let why = reason.map { " (\($0))" } ?? ""
                 self.emit(.info, "Refreshed top \(limit) threshold=\(String(format: "%.6f", snap.top500Threshold)) known=\(snap.knownCount)\(why)")
@@ -365,33 +558,474 @@ final class SubmissionManager: @unchecked Sendable {
         guard state.markAttemptIfEligible(seed: seed, score: score, userMinScore: userMinScore) else { return }
         pending.enter()
         queue.async {
-            Task {
-                defer { self.pending.leave() }
-
-                guard let res = await submitScore(seed: seed, score: score, config: self.config) else {
-                    self.emit(.error, "Submission failed for \(seed)")
-                    return
-                }
-
-                let tag = source.map { " (\($0))" } ?? ""
-                if res.accepted {
-                    self.state.markAccepted(seed: seed)
-                    self.acceptedLock.withLock {
-                        self.accepted.append(AcceptedSeed(time: Date(), seed: seed, score: score, rank: res.rank, source: source))
-                        if self.accepted.count > self.acceptedCapacity {
-                            self.accepted.removeFirst(self.accepted.count - self.acceptedCapacity)
-                        }
-                    }
-                    self.emit(.accepted, "Accepted seed=\(seed) score=\(String(format: "%.6f", score)) rank=\(res.rank ?? 0)\(tag)")
-                } else {
-                    self.emit(.rejected, "Rejected seed=\(seed) score=\(String(format: "%.6f", score)) (\(res.message ?? "unknown"))\(tag)")
-                }
+            self.submitSeq &+= 1
+            let task = SubmissionTask(seed: seed, score: score, source: source, seq: self.submitSeq)
+            self.insertTaskSorted(task)
+            self.setQueuedCount(self.submitQueue.count)
+            self.scheduleJournalWrite()
+            if !self.isSubmitting {
+                self.isSubmitting = true
+                self.submitNextLocked()
             }
         }
     }
 
     func waitForPendingSubmissions() {
         pending.wait()
+    }
+
+    func flushJournal() {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            writeJournalLocked()
+        } else {
+            queue.sync { self.writeJournalLocked() }
+        }
+    }
+
+    private func insertTaskSorted(_ task: SubmissionTask) {
+        if submitQueue.isEmpty {
+            submitQueue.append(task)
+            return
+        }
+
+        func isBefore(_ lhs: SubmissionTask, _ rhs: SubmissionTask) -> Bool {
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            return lhs.seq < rhs.seq
+        }
+
+        var lo = 0
+        var hi = submitQueue.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if isBefore(task, submitQueue[mid]) {
+                hi = mid
+            } else {
+                lo = mid + 1
+            }
+        }
+        submitQueue.insert(task, at: lo)
+    }
+
+    private func submitNextLocked() {
+        guard !submitQueue.isEmpty else {
+            isSubmitting = false
+            activeTask = nil
+            setQueuedCount(0)
+            scheduleJournalWrite()
+            return
+        }
+
+        let task = submitQueue.removeFirst()
+        activeTask = task
+        setQueuedCount(submitQueue.count)
+        scheduleJournalWrite()
+        Task {
+            await self.process(task)
+            self.pending.leave()
+            self.queue.async {
+                if let active = self.activeTask, active.seed == task.seed {
+                    self.activeTask = nil
+                }
+                self.scheduleJournalWrite()
+                self.submitNextLocked()
+            }
+        }
+    }
+
+    private func process(_ task: SubmissionTask) async {
+        let tag = task.source.map { " (\($0))" } ?? ""
+        var attempts = 0
+        while true {
+            await limiter.acquire()
+            recordSubmitAttempt()
+            guard let res = await submitScore(seed: task.seed, score: task.score, config: config) else {
+                attempts += 1
+                if attempts > maxRetries {
+                    emit(.error, "Submission failed for \(task.seed)\(tag)")
+                    recordFailed()
+                    return
+                }
+                let delay = retryDelay(attempt: attempts)
+                emit(.warning, "Submission failed for \(task.seed)\(tag), retrying in \(String(format: "%.1f", delay))s")
+                let ns = UInt64((delay * 1_000_000_000).rounded(.up))
+                try? await Task.sleep(nanoseconds: ns)
+                continue
+            }
+
+            if res.accepted {
+                await limiter.recordSuccess()
+                state.markAccepted(seed: task.seed)
+                recordAccepted()
+                acceptedLock.withLock {
+                    accepted.append(AcceptedSeed(time: Date(), seed: task.seed, score: task.score, rank: res.rank, source: task.source))
+                    if accepted.count > acceptedCapacity {
+                        accepted.removeFirst(accepted.count - acceptedCapacity)
+                    }
+                }
+                emit(.accepted, "Accepted seed=\(task.seed) score=\(String(format: "%.6f", task.score)) rank=\(res.rank ?? 0)\(tag)")
+                return
+            }
+
+            if res.isRateLimited {
+                recordRateLimited()
+                let delay = await limiter.recordRateLimit()
+                emit(.warning, "Rate limited submitting seed=\(task.seed)\(tag), backing off \(String(format: "%.1f", delay))s")
+                continue
+            }
+
+            if res.isRetryableServerError {
+                attempts += 1
+                if attempts > maxRetries {
+                    emit(.error, "Submission failed for \(task.seed)\(tag) (\(res.message ?? "unknown"))")
+                    recordFailed()
+                    return
+                }
+                let delay = retryDelay(attempt: attempts)
+                emit(.warning, "Submission failed for \(task.seed)\(tag) (\(res.message ?? "unknown")), retrying in \(String(format: "%.1f", delay))s")
+                let ns = UInt64((delay * 1_000_000_000).rounded(.up))
+                try? await Task.sleep(nanoseconds: ns)
+                continue
+            }
+
+            await limiter.recordSuccess()
+            recordRejected()
+            emit(.rejected, "Rejected seed=\(task.seed) score=\(String(format: "%.6f", task.score)) (\(res.message ?? "unknown"))\(tag)")
+            return
+        }
+    }
+
+    private func scheduleJournalWrite() {
+        guard !journalWritePending else { return }
+        journalWritePending = true
+        queue.asyncAfter(deadline: .now() + journalWriteDelay) {
+            self.writeJournalLocked()
+        }
+    }
+
+    private func writeJournalLocked() {
+        journalWritePending = false
+        var entries = submitQueue
+        if let activeTask {
+            entries.insert(activeTask, at: 0)
+        }
+        if entries.isEmpty {
+            do {
+                try FileManager.default.removeItem(at: journalURL)
+            } catch {
+                let nsErr = error as NSError
+                if nsErr.domain != NSCocoaErrorDomain || nsErr.code != CocoaError.fileNoSuchFile.rawValue {
+                    emit(.warning, "Warning: failed to remove submission queue journal: \(error)")
+                }
+            }
+            return
+        }
+
+        let payload = SubmissionJournal(
+            version: 1,
+            updatedAt: Date(),
+            entries: entries.map {
+                SubmissionJournalEntry(seed: $0.seed, score: $0.score, source: $0.source, seq: $0.seq)
+            }
+        )
+
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        enc.dateEncodingStrategy = .iso8601
+        do {
+            try FileManager.default.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try enc.encode(payload)
+            try data.write(to: journalURL, options: .atomic)
+        } catch {
+            emit(.warning, "Warning: failed to write submission queue journal: \(error)")
+        }
+    }
+
+    private func maybeLoadSubmissionJournal() {
+        guard !journalLoaded else { return }
+        let url = journalURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let snap = state.snapshot()
+        guard snap.top500Threshold.isFinite else {
+            journalDeferred = true
+            return
+        }
+        journalDeferred = false
+        journalLoaded = true
+        let threshold = max(userMinScore, snap.top500Threshold)
+        loadSubmissionJournal(from: url, threshold: threshold)
+    }
+
+    private func loadSubmissionJournal(from url: URL, threshold: Double) {
+        guard let data = try? Data(contentsOf: url) else { return }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        guard let journal = try? dec.decode(SubmissionJournal.self, from: data) else {
+            emit(.warning, "Warning: failed to decode submission queue journal at \(url.path)")
+            return
+        }
+        guard journal.version == 1 else {
+            emit(.warning, "Warning: unsupported submission queue journal version=\(journal.version) at \(url.path)")
+            return
+        }
+
+        var bySeed: [UInt64: SubmissionTask] = [:]
+        bySeed.reserveCapacity(journal.entries.count)
+        var maxSeq: UInt64 = submitSeq
+        for entry in journal.entries {
+            guard entry.score.isFinite else { continue }
+            let task = SubmissionTask(seed: entry.seed, score: entry.score, source: entry.source, seq: entry.seq)
+            if entry.seq > maxSeq { maxSeq = entry.seq }
+            if let existing = bySeed[entry.seed] {
+                if task.score > existing.score || (task.score == existing.score && task.seq < existing.seq) {
+                    bySeed[entry.seed] = task
+                }
+            } else {
+                bySeed[entry.seed] = task
+            }
+        }
+
+        let tasks = Array(bySeed.values).sorted {
+            if $0.score != $1.score { return $0.score > $1.score }
+            return $0.seq < $1.seq
+        }
+        submitSeq = maxSeq
+        submitQueue.removeAll(keepingCapacity: true)
+        for task in tasks {
+            guard task.score > threshold else { continue }
+            guard state.markAttemptIfEligible(seed: task.seed, score: task.score, userMinScore: userMinScore) else { continue }
+            submitQueue.append(task)
+            pending.enter()
+        }
+        setQueuedCount(submitQueue.count)
+        scheduleJournalWrite()
+        queue.async {
+            guard !self.submitQueue.isEmpty else { return }
+            if !self.isSubmitting {
+                self.isSubmitting = true
+                self.submitNextLocked()
+            }
+        }
+    }
+}
+
+final class AdaptiveScoreShift: @unchecked Sendable {
+    struct Update {
+        let oldValue: Double
+        let newValue: Double
+        let target: Double
+        let meanDelta: Double
+        let sampleCount: Int
+    }
+
+    private let lock = NSLock()
+    private var shift: Double
+    private var samples: [Double] = []
+    private var sum: Double = 0.0
+
+    let autoEnabled: Bool
+    private let minShift: Double
+    private let maxShift: Double
+    private let safety: Double
+    private let maxSamples: Int
+    private let minSamples: Int
+    private let decay: Double
+    private let minDelta: Double
+
+    init(
+        initial: Double,
+        autoEnabled: Bool,
+        minShift: Double = 0.0,
+        maxShift: Double = 0.5,
+        safety: Double = 0.0,
+        maxSamples: Int = 1024,
+        minSamples: Int = 64,
+        decay: Double = 0.1,
+        minDelta: Double = 0.001
+    ) {
+        self.shift = min(maxShift, max(minShift, initial))
+        self.autoEnabled = autoEnabled
+        self.minShift = minShift
+        self.maxShift = maxShift
+        self.safety = max(0.0, safety)
+        self.maxSamples = max(128, maxSamples)
+        self.minSamples = max(16, minSamples)
+        self.decay = min(1.0, max(0.0, decay))
+        self.minDelta = max(0.0, minDelta)
+    }
+
+    func current() -> Double {
+        lock.lock()
+        let v = shift
+        lock.unlock()
+        return v
+    }
+
+    func recordSample(mpsScore: Double, cpuScore: Double) -> Update? {
+        guard autoEnabled else { return nil }
+        guard mpsScore.isFinite, cpuScore.isFinite else { return nil }
+
+        let delta = cpuScore - mpsScore
+
+        lock.lock()
+        samples.append(delta)
+        sum += delta
+        if samples.count > maxSamples {
+            let drop = samples.count - maxSamples
+            for _ in 0..<drop {
+                if let first = samples.first {
+                    sum -= first
+                    samples.removeFirst()
+                }
+            }
+        }
+        guard samples.count >= minSamples else {
+            lock.unlock()
+            return nil
+        }
+
+        let meanDelta = sum / Double(samples.count)
+        var target = -meanDelta + safety
+        if target < minShift { target = minShift }
+        if target > maxShift { target = maxShift }
+
+        let old = shift
+        var next = shift
+        if target > shift {
+            next = target
+        } else if target < shift, decay > 0 {
+            next = max(target, shift - (shift - target) * decay)
+        }
+        if abs(next - old) < minDelta {
+            lock.unlock()
+            return nil
+        }
+        shift = next
+        lock.unlock()
+
+        return Update(oldValue: old, newValue: next, target: target, meanDelta: meanDelta, sampleCount: samples.count)
+    }
+}
+
+final class ThrottledAdjustmentLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private let interval: TimeInterval
+    private var lastEmit: TimeInterval = 0.0
+    private var startValue: Double = 0.0
+    private var lastValue: Double = 0.0
+    private var lastTarget: Double = 0.0
+    private var lastMeta: String = ""
+    private var updateCount: Int = 0
+
+    init(interval: TimeInterval) {
+        self.interval = max(1.0, interval)
+    }
+
+    func record(oldValue: Double, newValue: Double, target: Double, meta: String) -> String? {
+        let now = Date().timeIntervalSinceReferenceDate
+        lock.lock()
+        if updateCount == 0 {
+            startValue = oldValue
+            if lastEmit == 0.0 {
+                lastEmit = now
+            }
+        }
+        lastValue = newValue
+        lastTarget = target
+        lastMeta = meta
+        updateCount += 1
+
+        guard now - lastEmit >= interval else {
+            lock.unlock()
+            return nil
+        }
+
+        let net = lastValue - startValue
+        let msg = String(
+            format: "%.6f -> %.6f (Δ=%+.6f updates=%d target=%.6f %@)",
+            startValue, lastValue, net, updateCount, lastTarget, lastMeta
+        )
+        startValue = lastValue
+        updateCount = 0
+        lastEmit = now
+        lock.unlock()
+        return msg
+    }
+}
+
+private enum VerifyPriority {
+    case candidate
+    case sample
+}
+
+private struct VerifyTask {
+    let seed: UInt64
+    let source: String
+    let mpsScore: Float?
+    let mpsScoreRaw: Float?
+    let priority: VerifyPriority
+}
+
+private final class VerifyQueue: @unchecked Sendable {
+    private let cond = NSCondition()
+    private var high: [VerifyTask] = []
+    private var low: [VerifyTask] = []
+    private var closed = false
+    private let capacity: Int
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+        high.reserveCapacity(min(64, self.capacity))
+        low.reserveCapacity(min(64, self.capacity))
+    }
+
+    func push(_ task: VerifyTask) -> (enqueued: Bool, dropped: VerifyTask?) {
+        cond.lock()
+        defer { cond.unlock() }
+        if closed { return (false, nil) }
+        let count = high.count + low.count
+        if count >= capacity {
+            if task.priority == .sample {
+                return (false, nil)
+            }
+            if !low.isEmpty {
+                let dropped = low.removeFirst()
+                high.append(task)
+                cond.signal()
+                return (true, dropped)
+            }
+            return (false, nil)
+        }
+
+        switch task.priority {
+        case .candidate:
+            high.append(task)
+        case .sample:
+            low.append(task)
+        }
+        cond.signal()
+        return (true, nil)
+    }
+
+    func pop() -> VerifyTask? {
+        cond.lock()
+        defer { cond.unlock() }
+        while true {
+            if !high.isEmpty {
+                return high.removeFirst()
+            }
+            if !low.isEmpty {
+                return low.removeFirst()
+            }
+            if closed { return nil }
+            cond.wait()
+        }
+    }
+
+    func close() {
+        cond.lock()
+        closed = true
+        cond.broadcast()
+        cond.unlock()
     }
 }
 
@@ -402,12 +1036,15 @@ final class CandidateVerifier: @unchecked Sendable {
     private let events: ExploreEventLog?
     private let stats: ExploreStats
     private let margin: AdaptiveMargin?
-    private let queue = DispatchQueue(label: "gobx.verify", qos: .utility)
+    private let scoreShift: AdaptiveScoreShift?
+    private let marginLog = ThrottledAdjustmentLog(interval: 60.0)
+    private let shiftLog = ThrottledAdjustmentLog(interval: 60.0)
+    private let taskQueue: VerifyQueue
+    private let workerGroup = DispatchGroup()
+    private let workerCount: Int
     private let pending = DispatchGroup()
     private let seenLock = NSLock()
     private var seenSeeds = Set<UInt64>()
-    private let pendingLock = NSLock()
-    private var pendingCount = 0
     private let maxPending: Int
     private let scorer: Scorer
 
@@ -418,7 +1055,9 @@ final class CandidateVerifier: @unchecked Sendable {
         events: ExploreEventLog?,
         stats: ExploreStats,
         margin: AdaptiveMargin? = nil,
-        maxPending: Int = 512
+        scoreShift: AdaptiveScoreShift? = nil,
+        maxPending: Int = 512,
+        workerCount: Int = 1
     ) {
         self.best = best
         self.submission = submission
@@ -426,71 +1065,102 @@ final class CandidateVerifier: @unchecked Sendable {
         self.events = events
         self.stats = stats
         self.margin = margin
+        self.scoreShift = scoreShift
         self.maxPending = max(1, maxPending)
+        self.taskQueue = VerifyQueue(capacity: self.maxPending)
+        self.workerCount = max(1, workerCount)
         self.scorer = Scorer(size: 128)
+
+        for _ in 0..<self.workerCount {
+            workerGroup.enter()
+            DispatchQueue.global(qos: .utility).async {
+                defer { self.workerGroup.leave() }
+                while let task = self.taskQueue.pop() {
+                    self.process(task)
+                }
+            }
+        }
     }
 
-    func enqueue(seed: UInt64, source: String, mpsScore: Float? = nil) {
-        pendingLock.lock()
-        if pendingCount >= maxPending {
-            pendingLock.unlock()
-            return
-        }
-        pendingCount += 1
-        pendingLock.unlock()
-
+    func enqueue(seed: UInt64, source: String, mpsScore: Float? = nil, mpsScoreRaw: Float? = nil) {
         seenLock.lock()
         if seenSeeds.contains(seed) {
             seenLock.unlock()
-            pendingLock.lock()
-            pendingCount -= 1
-            pendingLock.unlock()
             return
         }
         seenSeeds.insert(seed)
         seenLock.unlock()
 
+        let priority: VerifyPriority = (source == "mps-sample") ? .sample : .candidate
+        let task = VerifyTask(seed: seed, source: source, mpsScore: mpsScore, mpsScoreRaw: mpsScoreRaw, priority: priority)
+
         pending.enter()
-        queue.async {
-            defer { self.pending.leave() }
-            defer {
-                self.pendingLock.lock()
-                self.pendingCount -= 1
-                self.pendingLock.unlock()
-            }
-            let exact = self.scorer.score(seed: seed).totalScore
-            self.stats.addCPUVerify(count: 1, scoreSum: exact, scoreSumSq: exact * exact)
-
-            if self.best.updateIfBetter(seed: seed, score: exact, source: source) {
-                let tag = " (\(source))"
-                let msg = "New best score: \(String(format: "%.6f", exact)) seed: \(seed)\(tag)"
-                if let events = self.events {
-                    events.append(.best, msg)
-                } else {
-                    self.printLock.withLock { print(msg) }
-                }
-            }
-
-            if let margin = self.margin, let mpsScore {
-                if let update = margin.recordSample(mpsScore: Double(mpsScore), cpuScore: exact) {
-                    let msg = String(
-                        format: "Adaptive mps-margin: %.6f -> %.6f (target %.6f, q=%.3f, n=%d)",
-                        update.oldValue, update.newValue, update.target, update.quantile, update.sampleCount
-                    )
-                    if let events = self.events {
-                        events.append(.info, msg)
-                    } else {
-                        self.printLock.withLock { print(msg) }
-                    }
-                }
-            }
-
-            self.submission?.maybeEnqueueSubmission(seed: seed, score: exact, source: source)
+        let result = taskQueue.push(task)
+        if !result.enqueued {
+            pending.leave()
+            seenLock.lock()
+            seenSeeds.remove(seed)
+            seenLock.unlock()
+            return
+        }
+        if let dropped = result.dropped {
+            pending.leave()
+            seenLock.lock()
+            seenSeeds.remove(dropped.seed)
+            seenLock.unlock()
         }
     }
 
     func wait() {
+        taskQueue.close()
         pending.wait()
+        workerGroup.wait()
+    }
+
+    private func process(_ task: VerifyTask) {
+        defer { pending.leave() }
+
+        let exact = scorer.score(seed: task.seed).totalScore
+        stats.addCPUVerify(count: 1, scoreSum: exact, scoreSumSq: exact * exact)
+
+        if best.updateIfBetter(seed: task.seed, score: exact, source: task.source) {
+            let tag = " (\(task.source))"
+            let msg = "New best score: \(String(format: "%.6f", exact)) seed: \(task.seed)\(tag)"
+            if let events = events {
+                events.append(.best, msg)
+            } else {
+                printLock.withLock { print(msg) }
+            }
+        }
+
+        if let margin, let mpsScore = task.mpsScore {
+            if let update = margin.recordSample(mpsScore: Double(mpsScore), cpuScore: exact) {
+                let meta = String(format: "q=%.3f n=%d", update.quantile, update.sampleCount)
+                if let summary = marginLog.record(oldValue: update.oldValue, newValue: update.newValue, target: update.target, meta: meta) {
+                    let msg = "Adaptive mps-margin: \(summary)"
+                    if let events {
+                        events.append(.info, msg)
+                    } else {
+                        printLock.withLock { print(msg) }
+                    }
+                }
+            }
+        }
+        if let scoreShift, let mpsScoreRaw = task.mpsScoreRaw {
+            if let update = scoreShift.recordSample(mpsScore: Double(mpsScoreRaw), cpuScore: exact) {
+                let meta = String(format: "meanΔ=%.6f n=%d", update.meanDelta, update.sampleCount)
+                if let summary = shiftLog.record(oldValue: update.oldValue, newValue: update.newValue, target: update.target, meta: meta) {
+                    let msg = "Adaptive mps-shift: \(summary)"
+                    if let events {
+                        events.append(.info, msg)
+                    } else {
+                        printLock.withLock { print(msg) }
+                    }
+                }
+            }
+        }
+
+        submission?.maybeEnqueueSubmission(seed: task.seed, score: exact, source: task.source)
     }
 }
 

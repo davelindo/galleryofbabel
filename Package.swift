@@ -14,7 +14,8 @@ let package = Package(
             name: "gobx",
             path: "Sources/gobx",
             resources: [
-                .copy("Resources/selftest_golden.json")
+                .copy("Resources/selftest_golden.json"),
+                .copy("Metal/PyramidProxy.metal")
             ]
         )
     ]

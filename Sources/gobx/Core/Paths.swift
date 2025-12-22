@@ -17,6 +17,22 @@ enum GobxPaths {
         configDir.appendingPathComponent("gobx-mps-calibration.json")
     }
 
+    static var metalCalibrationURL: URL {
+        configDir.appendingPathComponent("gobx-metal-calibration.json")
+    }
+
+    static var proxyWeightsURL: URL {
+        configDir.appendingPathComponent("gobx-proxy-weights.json")
+    }
+
+    static var metalProxyWeightsURL: URL {
+        configDir.appendingPathComponent("gobx-proxy-weights-metal.json")
+    }
+
+    static var submissionQueueURL: URL {
+        configDir.appendingPathComponent("gobx-submission-queue.json")
+    }
+
     static func expandPath(_ path: String) -> String {
         (path as NSString).expandingTildeInPath
     }

@@ -39,17 +39,14 @@ enum MPSScorerError: Error, CustomStringConvertible {
     }
 }
 
-final class MPSScorer {
-    static let scorerVersion: Int = 1
+final class MPSScorer: GPUScorer {
+    static let scorerVersion: Int = 3
 
     static func isMetalAvailable() -> Bool {
         return MTLCreateSystemDefaultDevice() != nil
     }
 
-    struct Job {
-        let slotIndex: Int
-        let count: Int
-    }
+    typealias Job = GPUJob
 
     let batchSize: Int
     let imageSize: Int
@@ -131,7 +128,22 @@ final class MPSScorer {
         self.commandQueue = queue
         self.graphDevice = MPSGraphDevice(mtlDevice: device)
 
-        let (graph, seedPh, scoreT) = MPSScorer.buildGraph(batchSize: batchSize, imageSize: imageSize)
+        let proxyConfig = ProxyConfig.mpsDefault(imageSize: imageSize)
+        let featureCount = WaveletProxy.featureCount(for: imageSize, config: proxyConfig)
+        let weightsURL = GobxPaths.proxyWeightsURL
+        let (proxyWeights, _) = ProxyWeights.loadOrDefault(
+            from: weightsURL,
+            imageSize: imageSize,
+            featureCount: featureCount,
+            expectedConfig: proxyConfig
+        )
+        let (proxyBias, proxyWeightsF) = proxyWeights.asFloatWeights(expectedCount: featureCount)
+        let (graph, seedPh, scoreT) = MPSScorer.buildGraph(
+            batchSize: batchSize,
+            imageSize: imageSize,
+            proxyWeights: proxyWeightsF,
+            proxyBias: proxyBias
+        )
         self.seedPlaceholder = seedPh
         self.scoreTensor = scoreT
 
@@ -254,13 +266,22 @@ final class MPSScorer {
         )
     }
 
-    private static func buildGraph(batchSize: Int, imageSize: Int) -> (MPSGraph, MPSGraphTensor, MPSGraphTensor) {
+    private static func buildGraph(
+        batchSize: Int,
+        imageSize: Int,
+        proxyWeights: [Float],
+        proxyBias: Float
+    ) -> (MPSGraph, MPSGraphTensor, MPSGraphTensor) {
         let g = MPSGraph()
 
         let H = imageSize
         let W = imageSize
         let N = H * W
-        let half = H / 2
+        let proxyConfig = ProxyConfig.mpsDefault(imageSize: imageSize)
+        precondition(proxyWeights.count == WaveletProxy.featureCount(for: imageSize, config: proxyConfig), "proxyWeights feature count mismatch")
+        let levelCount = WaveletProxy.levelCount(for: imageSize)
+        let shapeLevels = WaveletProxy.shapeLevelIndices(levelCount: levelCount)
+        let shapeLevelSet = Set(shapeLevels)
 
         // ---- Precomputed constants (CPU side, embedded as graph constants)
         let offsetsU32: [UInt32] = {
@@ -271,65 +292,6 @@ final class MPSScorer {
                 out[i] = acc
             }
             return out
-        }()
-
-        let (rBinsI32, rCountsF, maxR): ([Int32], [Float], Int) = {
-            let cy = Double(H - 1) / 2.0
-            let cx = Double(W - 1) / 2.0
-            let maxR = Int(floor(sqrt(cx * cx + cy * cy))) + 1
-            var counts = [Int](repeating: 0, count: maxR)
-            var bins = [Int32](repeating: 0, count: N)
-            for y in 0..<H {
-                for x in 0..<W {
-                    let r = Int(floor(sqrt(pow(Double(y) - cy, 2) + pow(Double(x) - cx, 2))))
-                    let idx = y * W + x
-                    bins[idx] = Int32(r)
-                    counts[r] += 1
-                }
-            }
-            return (bins, counts.map { Float($0) }, maxR)
-        }()
-
-        let (ringMaskF, ringCountF): ([Float], Float) = {
-            let cy = Double(H - 1) / 2.0
-            let cx = Double(W - 1) / 2.0
-            let rMax = sqrt(cx * cx + cy * cy)
-            let rMin = ScoringConstants.peakinessRMinFrac * rMax
-            let rMaxUse = ScoringConstants.peakinessRMaxFrac * rMax
-            var mask = [Float](repeating: 0, count: N)
-            var count = 0
-            for y in 0..<H {
-                for x in 0..<W {
-                    let r = sqrt(pow(Double(y) - cy, 2) + pow(Double(x) - cx, 2))
-                    let idx = y * W + x
-                    if r >= rMin && r <= rMaxUse {
-                        mask[idx] = 1
-                        count += 1
-                    }
-                }
-            }
-            return (mask, Float(count))
-        }()
-
-        let (alphaMaskF, alphaXVecF, alphaN, alphaSumX, alphaSumX2): ([Float], [Float], Float, Float, Float) = {
-            let rMaxIndex = maxR - 1
-            let fitRMax = max(ScoringConstants.alphaFitRMin + 2, Int(floor(Float(rMaxIndex) * ScoringConstants.Float32.alphaFitRMaxFrac)))
-            var mask = [Float](repeating: 0, count: maxR)
-            var xVec = [Float](repeating: 0, count: maxR)
-            var n: Float = 0
-            var sumX: Double = 0
-            var sumX2: Double = 0
-            for r in 0..<maxR {
-                let x = log(Double(r) + ScoringConstants.eps)
-                xVec[r] = Float(x)
-                if r >= ScoringConstants.alphaFitRMin && r <= fitRMax {
-                    mask[r] = 1
-                    n += 1
-                    sumX += x
-                    sumX2 += x * x
-                }
-            }
-            return (mask, xVec, n, Float(sumX), Float(sumX2))
         }()
 
         // ---- Seed input
@@ -448,126 +410,107 @@ final class MPSScorer {
         let neighDeltaPos = g.maximum(neighDelta, g.constant(0.0, dataType: .float32), name: "neighDeltaPos")
         let neighborCorrPenalty = g.multiplication(neighDeltaPos, g.constant(-ScoringConstants.neighborCorrWeight, dataType: .float32), name: "neighborCorrPenalty")
 
-        // FFT + power spectrum
-        let fftDesc = MPSGraphFFTDescriptor()
-        fftDesc.inverse = false
-        fftDesc.scalingMode = .none
+        // 2x2 pyramid variance proxy (Haar-style octave features)
+        let poolDesc = MPSGraphPooling2DOpDescriptor()
+        poolDesc.kernelWidth = 2
+        poolDesc.kernelHeight = 2
+        poolDesc.strideInX = 2
+        poolDesc.strideInY = 2
+        poolDesc.dilationRateInX = 1
+        poolDesc.dilationRateInY = 1
+        poolDesc.paddingStyle = .explicit
+        poolDesc.paddingLeft = 0
+        poolDesc.paddingRight = 0
+        poolDesc.paddingTop = 0
+        poolDesc.paddingBottom = 0
+        poolDesc.dataLayout = .NHWC
+        poolDesc.includeZeroPadToAverage = false
 
-        let fft = g.fastFourierTransform(data, axes: [1, 2] as [NSNumber], descriptor: fftDesc, name: "fft")
-        let re = g.realPartOfTensor(tensor: fft, name: "re")
-        let im = g.imaginaryPartOfTensor(tensor: fft, name: "im")
-        let re2 = g.multiplication(re, re, name: "re2")
-        let im2 = g.multiplication(im, im, name: "im2")
-        let power = g.addition(re2, im2, name: "power")
+        let zero = g.constant(0.0, dataType: .float32)
+        let eps = g.constant(ScoringConstants.eps, dataType: .float32)
+        let one = g.constant(1.0, dataType: .float32)
 
-        // fftShift: shift by half in both spatial dims (1,2)
-        let pTop = g.sliceTensor(power, dimension: 1, start: half, length: half, name: "pTop")
-        let pBot = g.sliceTensor(power, dimension: 1, start: 0, length: half, name: "pBot")
-        let pRowShift = g.concatTensors([pTop, pBot], dimension: 1, name: "pRowShift")
-        let pRight = g.sliceTensor(pRowShift, dimension: 2, start: half, length: half, name: "pRight")
-        let pLeft = g.sliceTensor(pRowShift, dimension: 2, start: 0, length: half, name: "pLeft")
-        let pShift = g.concatTensors([pRight, pLeft], dimension: 2, name: "pShift")
+        func toColumn(_ t: MPSGraphTensor, _ name: String) -> MPSGraphTensor {
+            g.reshape(t, shape: [NSNumber(value: batchSize), 1], name: name)
+        }
 
-        // Ring stats (used for both peakiness + flatness)
-        let ringMaskData = ringMaskF.withUnsafeBytes { Data($0) }
-        let ringMask = g.constant(ringMaskData, shape: [NSNumber(value: H), NSNumber(value: W)], dataType: .float32)
-        let ringMask3 = g.reshape(ringMask, shape: [1, NSNumber(value: H), NSNumber(value: W)], name: "ringMask3")
-        let ringVals = g.multiplication(pShift, ringMask3, name: "ringVals")
+        var current = data
+        var currentSize = H
+        var level = 0
+        var energies: [MPSGraphTensor] = []
+        energies.reserveCapacity(levelCount)
+        var maxes = [MPSGraphTensor?](repeating: nil, count: levelCount)
+        var e2s = [MPSGraphTensor?](repeating: nil, count: levelCount)
 
-        let ringSum = g.reductionSum(with: ringVals, axes: [1, 2] as [NSNumber], name: "ringSum")
-        let ringMean = g.division(ringSum, g.constant(Double(ringCountF), dataType: .float32), name: "ringMean")
+        while currentSize >= 2 {
+            let x2 = g.multiplication(current, current, name: "x2_l\(level)")
+            let shape4 = [NSNumber(value: batchSize), NSNumber(value: currentSize), NSNumber(value: currentSize), 1]
+            let shape3 = [NSNumber(value: batchSize), NSNumber(value: currentSize / 2), NSNumber(value: currentSize / 2)]
 
-        let ringMax = g.reductionMaximum(with: ringVals, axes: [1, 2] as [NSNumber], name: "ringMax")
+            let x4 = g.reshape(current, shape: shape4, name: "x4_l\(level)")
+            let x2_4 = g.reshape(x2, shape: shape4, name: "x2_4_l\(level)")
+            let m4 = g.avgPooling2D(withSourceTensor: x4, descriptor: poolDesc, name: "m4_l\(level)")
+            let m2_4 = g.avgPooling2D(withSourceTensor: x2_4, descriptor: poolDesc, name: "m2_4_l\(level)")
 
-        let logInput = g.addition(pShift, g.constant(ScoringConstants.eps, dataType: .float32), name: "logInput")
-        let logAll = g.logarithm(with: logInput, name: "logAll")
-        let ringLog = g.multiplication(logAll, ringMask3, name: "ringLog")
-        let ringLogSum = g.reductionSum(with: ringLog, axes: [1, 2] as [NSNumber], name: "ringLogSum")
-        let ringLogMean = g.division(ringLogSum, g.constant(Double(ringCountF), dataType: .float32), name: "ringLogMean")
-        let ringGM = g.exponent(with: ringLogMean, name: "ringGM")
+            let m = g.reshape(m4, shape: shape3, name: "m_l\(level)")
+            let m2 = g.reshape(m2_4, shape: shape3, name: "m2_l\(level)")
+            let varRaw = g.subtraction(m2, g.multiplication(m, m, name: nil), name: "var_l\(level)")
+            let varClamped = g.maximum(varRaw, zero, name: "varc_l\(level)")
 
-        // Approx peakiness: log10(max / gm)
-        let peakRatio = g.division(
-            g.addition(ringMax, g.constant(ScoringConstants.eps, dataType: .float32), name: nil),
-            g.addition(ringGM, g.constant(ScoringConstants.eps, dataType: .float32), name: nil),
-            name: "peakRatio"
-        )
-        let peakiness = g.multiplication(
-            g.logarithm(with: g.addition(peakRatio, g.constant(ScoringConstants.eps, dataType: .float32), name: nil), name: nil),
-            g.constant(1.0 / log(10.0), dataType: .float32),
-            name: "peakiness"
-        )
-        let peakinessPenalty = g.multiplication(peakiness, g.constant(-ScoringConstants.lambdaPeakiness, dataType: .float32), name: "peakinessPenalty")
+            let ek = g.mean(of: varClamped, axes: [1, 2] as [NSNumber], name: "Ek_l\(level)")
+            energies.append(toColumn(ek, "Ek1d_l\(level)"))
+            if shapeLevelSet.contains(level) {
+                let mk = g.reductionMaximum(with: varClamped, axes: [1, 2] as [NSNumber], name: "Mk_l\(level)")
+                let e2k = g.mean(of: g.multiplication(varClamped, varClamped, name: nil), axes: [1, 2] as [NSNumber], name: "E2k_l\(level)")
+                maxes[level] = toColumn(mk, "Mk1d_l\(level)")
+                e2s[level] = toColumn(e2k, "E2k1d_l\(level)")
+            }
 
-        // Flatness
-        let flatness = g.division(
-            ringGM,
-            g.addition(ringMean, g.constant(ScoringConstants.eps, dataType: .float32), name: nil),
-            name: "flatness"
-        )
-        let flatDelta = g.subtraction(flatness, g.constant(ScoringConstants.flatnessMax, dataType: .float32), name: "flatDelta")
-        let flatDeltaPos = g.maximum(flatDelta, g.constant(0.0, dataType: .float32), name: "flatDeltaPos")
-        let flatnessPenalty = g.multiplication(flatDeltaPos, g.constant(-ScoringConstants.flatnessWeight, dataType: .float32), name: "flatnessPenalty")
+            current = m
+            currentSize /= 2
+            level += 1
+        }
 
-        // Radial mean power via scatter-add into radius bins
-        let powerFlat2 = g.reshape(pShift, shape: [NSNumber(value: batchSize), NSNumber(value: N)], name: "powerFlat2")
-        let rBinsData = rBinsI32.withUnsafeBytes { Data($0) }
-        let rBins = g.constant(rBinsData, shape: [NSNumber(value: N)], dataType: .int32)
-        let rBins2 = g.reshape(rBins, shape: [1, NSNumber(value: N)], name: "rBins2")
-        let rBinsB = g.broadcast(rBins2, shape: [NSNumber(value: batchSize), NSNumber(value: N)], name: "rBinsB")
-        let rBinsND = g.reshape(rBinsB, shape: [NSNumber(value: batchSize), NSNumber(value: N), 1], name: "rBinsND")
-        let sumsByR = g.scatterND(
-            withUpdatesTensor: powerFlat2,
-            indicesTensor: rBinsND,
-            shape: [NSNumber(value: batchSize), NSNumber(value: maxR)],
-            batchDimensions: 1,
-            mode: .add,
-            name: "sumsByR"
-        )
-        let rCountsData = rCountsF.withUnsafeBytes { Data($0) }
-        let rCounts = g.constant(rCountsData, shape: [NSNumber(value: maxR)], dataType: .float32)
-        let rCounts2 = g.reshape(rCounts, shape: [1, NSNumber(value: maxR)], name: "rCounts2")
-        let meanPower = g.division(sumsByR, rCounts2, name: "meanPower")
+        var featureCols: [MPSGraphTensor] = []
+        featureCols.append(contentsOf: energies)
 
-        // Alpha estimation: slope of log(meanPower) vs log(r) in [R_MIN..fitRMax]
-        let alphaMaskData = alphaMaskF.withUnsafeBytes { Data($0) }
-        let alphaMask = g.constant(alphaMaskData, shape: [NSNumber(value: maxR)], dataType: .float32)
-        let alphaMask2 = g.reshape(alphaMask, shape: [1, NSNumber(value: maxR)], name: "alphaMask2")
+        if energies.count > 1 {
+            for i in 0..<(energies.count - 1) {
+                let denom = g.addition(energies[i + 1], eps, name: "Rden_l\(i)")
+                let ratio = g.division(energies[i], denom, name: "R_l\(i)")
+                featureCols.append(ratio)
+            }
+        }
 
-        let xData = alphaXVecF.withUnsafeBytes { Data($0) }
-        let xVec = g.constant(xData, shape: [NSNumber(value: maxR)], dataType: .float32)
-        let xVec2 = g.reshape(xVec, shape: [1, NSNumber(value: maxR)], name: "xVec2")
+        for idx in shapeLevels {
+            let mk = maxes[idx]!
+            let denom = g.addition(energies[idx], eps, name: "Pden_l\(idx)")
+            let peak = g.division(mk, denom, name: "Peak_l\(idx)")
+            featureCols.append(peak)
+        }
 
-        let yVec = g.logarithm(with: g.addition(meanPower, g.constant(ScoringConstants.eps, dataType: .float32), name: nil), name: "yVec")
-        let yMasked = g.multiplication(yVec, alphaMask2, name: "yMasked")
-        let sumY = g.reductionSum(with: yMasked, axes: [1] as [NSNumber], name: "sumY")
-        let sumXY = g.reductionSum(with: g.multiplication(yMasked, xVec2, name: nil), axes: [1] as [NSNumber], name: "sumXY")
+        for idx in shapeLevels {
+            let e2k = e2s[idx]!
+            let denom = g.addition(g.multiplication(energies[idx], energies[idx], name: nil), eps, name: "Cvden_l\(idx)")
+            let cv2 = g.subtraction(g.division(e2k, denom, name: nil), one, name: "Cv2_l\(idx)")
+            featureCols.append(cv2)
+        }
 
-        let nFit = g.constant(Double(alphaN), dataType: .float32)
-        let sumXc = g.constant(Double(alphaSumX), dataType: .float32)
-        let sumX2c = g.constant(Double(alphaSumX2), dataType: .float32)
+        let features = g.concatTensors(featureCols, dimension: 1, name: "features")
+        let featureCount = WaveletProxy.featureCount(for: imageSize, config: proxyConfig)
+        precondition(featureCols.count == featureCount, "feature column count mismatch")
+        let weightsData = proxyWeights.withUnsafeBytes { Data($0) }
+        let weights = g.constant(weightsData, shape: [NSNumber(value: featureCount)], dataType: .float32)
+        let weights2 = g.reshape(weights, shape: [1, NSNumber(value: featureCount)], name: "weights2")
+        let weightsB = g.broadcast(weights2, shape: [NSNumber(value: batchSize), NSNumber(value: featureCount)], name: "weightsB")
+        let weighted = g.multiplication(features, weightsB, name: "weighted")
+        let proxySum = g.reductionSum(with: weighted, axes: [1] as [NSNumber], name: "proxySum")
+        let proxyScore = g.addition(proxySum, g.constant(Double(proxyBias), dataType: .float32), name: "proxyScore")
 
-        let num = g.subtraction(g.multiplication(nFit, sumXY, name: nil), g.multiplication(sumXc, sumY, name: nil), name: "alphaNum")
-        let den = g.subtraction(g.multiplication(nFit, sumX2c, name: nil), g.multiplication(sumXc, sumXc, name: nil), name: "alphaDen")
-        let slope = g.division(num, den, name: "slope")
-        let alphaEst = g.multiplication(slope, g.constant(-1.0, dataType: .float32), name: "alphaEst")
-        let alphaScore = g.multiplication(
-            g.absolute(with: g.subtraction(alphaEst, g.constant(ScoringConstants.targetAlpha, dataType: .float32), name: nil), name: nil),
-            g.constant(-1.0, dataType: .float32),
-            name: "alphaScore"
-        )
-
-        // MPSGraph reductions often keep reduced dimensions (size=1). Ensure we return a 1D [batch] tensor.
-        let alphaScore1d = g.reshape(alphaScore, shape: [NSNumber(value: batchSize)], name: "alphaScore1d")
-        let peakinessPenalty1d = g.reshape(peakinessPenalty, shape: [NSNumber(value: batchSize)], name: "peakinessPenalty1d")
-        let flatnessPenalty1d = g.reshape(flatnessPenalty, shape: [NSNumber(value: batchSize)], name: "flatnessPenalty1d")
+        let proxyScore1d = g.reshape(proxyScore, shape: [NSNumber(value: batchSize)], name: "proxyScore1d")
         let neighborCorrPenalty1d = g.reshape(neighborCorrPenalty, shape: [NSNumber(value: batchSize)], name: "neighborCorrPenalty1d")
 
-        let total = g.addition(
-            g.addition(alphaScore1d, peakinessPenalty1d, name: "s1"),
-            g.addition(flatnessPenalty1d, neighborCorrPenalty1d, name: "s2"),
-            name: "totalScore"
-        )
+        let total = g.addition(proxyScore1d, neighborCorrPenalty1d, name: "totalScore")
 
         return (g, seeds, total)
     }

@@ -2,12 +2,12 @@
 
 **gobx** is a high-performance, native explorer and scorer for the [Gallery of Babel](https://www.echohive.ai/gallery-of-babel/).
 
-This repo is a small exploration into using **Metal Performance Shaders (MPSGraph)** for brute-force search over a deterministic noise field, based on the scoring ideas described in:
+This repo is a small exploration into using GPU proxies (MPSGraph and a fused Metal kernel) for brute-force search over a deterministic noise field, based on the scoring ideas described in:
 - https://www.echohive.ai/gallery-of-babel/how-it-works
 
 It features a dual-backend architecture:
 *   **CPU:** Reference implementation using Apple's **Accelerate** framework (vDSP/LinearAlgebra) for maximum precision.
-*   **MPS:** Massively parallel approximation using **Metal Performance Shaders** for high-throughput exploration on Apple Silicon GPUs.
+*   **GPU:** High-throughput approximation on Apple Silicon. The default Metal path uses a fused 2x2 pyramid kernel that keeps intermediate tiles in threadgroup memory (no full image writes), enabling up to ~20x speedups vs the older FFT/MPSGraph proxy on supported hardware. MPSGraph remains available as a fallback.
 
 ## Features
 
@@ -66,10 +66,10 @@ If no profile is configured, `gobx explore` will fall back to the default author
 ## Usage
 
 ### 1. Exploration (Mining)
-The main command to search for seeds. By default, it uses MPS when available and submits results.
+The main command to search for seeds. By default, it uses the GPU backend when available and submits results.
 
 ```bash
-# Run endless exploration (uses MPS if available, otherwise CPU)
+# Run endless exploration (uses GPU if available, otherwise CPU)
 gobx explore --endless
 
 # Force CPU-only
@@ -80,7 +80,7 @@ gobx explore --backend mps --batch 192 --mps-inflight 2
 ```
 
 Defaults:
-- Metal available: `--backend mps --submit --mps-batch-auto --mps-margin-auto --top-unique-users`
+- Metal available: `--backend mps --gpu-backend metal --submit --mps-batch-auto --mps-inflight-auto --mps-margin-auto --top-unique-users`
 - Metal unavailable: `--backend cpu --submit --top-unique-users`
 
 ### 2. Scoring a Specific Seed

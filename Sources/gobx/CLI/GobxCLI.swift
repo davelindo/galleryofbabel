@@ -23,8 +23,16 @@ enum GobxCLI {
                 try BenchMPS.run(args: rest)
             case "bench-mps-worker":
                 try BenchMPS.runWorker(args: rest)
+            case "bench-metal":
+                try BenchMetal.run(args: rest)
             case "calibrate-mps":
                 try CalibrateMPS.run(args: rest)
+            case "calibrate-metal":
+                try CalibrateMetal.run(args: rest)
+            case "proxy-eval":
+                try ProxyEvalCommand.run(args: rest)
+            case "train-proxy":
+                try TrainProxyCommand.run(args: rest)
             case "explore":
                 try await ExploreCommand.run(args: rest)
             default:
