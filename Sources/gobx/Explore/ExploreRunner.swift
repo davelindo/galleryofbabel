@@ -26,7 +26,7 @@ enum ExploreRunner {
         let mpsMarginAutoSpecified = options.mpsMarginAutoSpecified
         let mpsInflight = options.mpsInflight
         let mpsWorkers = options.mpsWorkers
-        let mpsInflightAuto = options.mpsInflightAuto
+        var mpsInflightAuto = options.mpsInflightAuto
         var mpsInflightMin = options.mpsInflightMin
         var mpsInflightMax = options.mpsInflightMax
         let mpsInflightMinSpecified = options.mpsInflightMinSpecified
