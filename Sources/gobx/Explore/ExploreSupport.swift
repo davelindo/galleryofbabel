@@ -348,6 +348,14 @@ actor SubmissionRateLimiter {
         }
     }
 
+    func backoffDelay() -> TimeInterval {
+        let now = Date().timeIntervalSinceReferenceDate
+        if backoffUntil > now {
+            return backoffUntil - now
+        }
+        return 0.0
+    }
+
     func recordRateLimit() -> TimeInterval {
         let now = Date().timeIntervalSinceReferenceDate
         backoffStep = min(backoffStep + 1, 10)
@@ -379,6 +387,11 @@ final class SubmissionManager: @unchecked Sendable {
         let score: Double
         let source: String?
         let seq: UInt64
+    }
+
+    private enum SubmissionOutcome {
+        case completed
+        case requeue(delay: TimeInterval)
     }
 
     private struct SubmissionJournal: Codable {
@@ -433,6 +446,7 @@ final class SubmissionManager: @unchecked Sendable {
     private var journalDeferred = false
     private var journalWritePending = false
     private let journalWriteDelay: TimeInterval = 1.0
+    private var backoffScheduled = false
     private let acceptedLock = NSLock()
     private var accepted: [AcceptedSeed] = []
     private let acceptedCapacity = 20
@@ -620,22 +634,37 @@ final class SubmissionManager: @unchecked Sendable {
         setQueuedCount(submitQueue.count)
         scheduleJournalWrite()
         Task {
-            await self.process(task)
-            self.pending.leave()
+            let outcome = await self.process(task)
             self.queue.async {
-                if let active = self.activeTask, active.seed == task.seed {
-                    self.activeTask = nil
+                switch outcome {
+                case .completed:
+                    self.pending.leave()
+                    if let active = self.activeTask, active.seed == task.seed {
+                        self.activeTask = nil
+                    }
+                    self.scheduleJournalWrite()
+                    self.submitNextLocked()
+                case .requeue(let delay):
+                    if let active = self.activeTask, active.seed == task.seed {
+                        self.activeTask = nil
+                    }
+                    self.insertTaskSorted(task)
+                    self.setQueuedCount(self.submitQueue.count)
+                    self.scheduleJournalWrite()
+                    self.scheduleBackoff(delay)
                 }
-                self.scheduleJournalWrite()
-                self.submitNextLocked()
             }
         }
     }
 
-    private func process(_ task: SubmissionTask) async {
+    private func process(_ task: SubmissionTask) async -> SubmissionOutcome {
         let tag = task.source.map { " (\($0))" } ?? ""
         var attempts = 0
         while true {
+            let delay = await limiter.backoffDelay()
+            if delay > 0 {
+                return .requeue(delay: delay)
+            }
             await limiter.acquire()
             recordSubmitAttempt()
             guard let res = await submitScore(seed: task.seed, score: task.score, config: config) else {
@@ -643,7 +672,7 @@ final class SubmissionManager: @unchecked Sendable {
                 if attempts > maxRetries {
                     emit(.error, "Submission failed for \(task.seed)\(tag)")
                     recordFailed()
-                    return
+                    return .completed
                 }
                 let delay = retryDelay(attempt: attempts)
                 emit(.warning, "Submission failed for \(task.seed)\(tag), retrying in \(String(format: "%.1f", delay))s")
@@ -663,14 +692,14 @@ final class SubmissionManager: @unchecked Sendable {
                     }
                 }
                 emit(.accepted, "Accepted seed=\(task.seed) score=\(String(format: "%.6f", task.score)) rank=\(res.rank ?? 0)\(tag)")
-                return
+                return .completed
             }
 
             if res.isRateLimited {
                 recordRateLimited()
                 let delay = await limiter.recordRateLimit()
                 emit(.warning, "Rate limited submitting seed=\(task.seed)\(tag), backing off \(String(format: "%.1f", delay))s")
-                continue
+                return .requeue(delay: delay)
             }
 
             if res.isRetryableServerError {
@@ -678,7 +707,7 @@ final class SubmissionManager: @unchecked Sendable {
                 if attempts > maxRetries {
                     emit(.error, "Submission failed for \(task.seed)\(tag) (\(res.message ?? "unknown"))")
                     recordFailed()
-                    return
+                    return .completed
                 }
                 let delay = retryDelay(attempt: attempts)
                 emit(.warning, "Submission failed for \(task.seed)\(tag) (\(res.message ?? "unknown")), retrying in \(String(format: "%.1f", delay))s")
@@ -690,7 +719,21 @@ final class SubmissionManager: @unchecked Sendable {
             await limiter.recordSuccess()
             recordRejected()
             emit(.rejected, "Rejected seed=\(task.seed) score=\(String(format: "%.6f", task.score)) (\(res.message ?? "unknown"))\(tag)")
+            return .completed
+        }
+    }
+
+    private func scheduleBackoff(_ delay: TimeInterval) {
+        let wait = max(0.0, delay)
+        if wait <= 0.0 {
+            submitNextLocked()
             return
+        }
+        guard !backoffScheduled else { return }
+        backoffScheduled = true
+        queue.asyncAfter(deadline: .now() + wait) {
+            self.backoffScheduled = false
+            self.submitNextLocked()
         }
     }
 

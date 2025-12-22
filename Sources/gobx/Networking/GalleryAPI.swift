@@ -36,6 +36,7 @@ private func runHTTP(url: URL, method: String, jsonBody: Data?, timeoutSec: Time
     request.httpMethod = method
     request.timeoutInterval = max(1.0, timeoutSec)
     request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(BuildInfo.userAgent, forHTTPHeaderField: "User-Agent")
 
     if let jsonBody {
         request.httpBody = jsonBody
