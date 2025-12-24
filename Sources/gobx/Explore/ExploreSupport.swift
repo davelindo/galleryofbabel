@@ -232,16 +232,18 @@ final class SubmissionState: @unchecked Sendable {
     private let lock = NSLock()
     private var knownSeeds = Set<UInt64>()
     private var attemptedSeeds = Set<UInt64>()
+    private var topScores: [Double] = []
     private var top500Threshold: Double = -Double.infinity
     private var lastRefresh: Date = .distantPast
 
     func mergeTop(_ top: TopResponse) {
         lock.lock()
+        topScores = top.images.map { $0.score }.sorted(by: >)
         for img in top.images {
             knownSeeds.insert(img.seed)
         }
-        if let last = top.images.last {
-            top500Threshold = last.score
+        if let last = topScores.last {
+            top500Threshold = last
         }
         lastRefresh = Date()
         lock.unlock()
@@ -271,6 +273,36 @@ final class SubmissionState: @unchecked Sendable {
         lock.lock()
         attemptedSeeds.insert(seed)
         lock.unlock()
+    }
+
+    func isKnown(seed: UInt64) -> Bool {
+        lock.lock()
+        let known = knownSeeds.contains(seed)
+        lock.unlock()
+        return known
+    }
+
+    func difficultyPercentile(score: Double) -> Double? {
+        lock.lock()
+        let scores = topScores
+        lock.unlock()
+        guard !scores.isEmpty else { return nil }
+        if scores.count == 1 { return 1.0 }
+        if score >= scores[0] { return 1.0 }
+        if score <= scores[scores.count - 1] { return 0.0 }
+
+        var lo = 0
+        var hi = scores.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if scores[mid] > score {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        let above = max(0, min(scores.count - 1, lo))
+        return Double(scores.count - above - 1) / Double(scores.count - 1)
     }
 
     func markAccepted(seed: UInt64) {
@@ -378,6 +410,7 @@ final class SubmissionManager: @unchecked Sendable {
         let time: Date
         let seed: UInt64
         let score: Double
+        let difficultyPercentile: Double?
         let rank: Int?
         let source: String?
     }
@@ -414,6 +447,8 @@ final class SubmissionManager: @unchecked Sendable {
         let rateLimitedCount: UInt64
         let failedCount: UInt64
         let queuedCount: Int
+        let queuedMinScore: Double?
+        let queuedMaxScore: Double?
     }
 
     private let config: AppConfig
@@ -437,6 +472,8 @@ final class SubmissionManager: @unchecked Sendable {
     private var rateLimitedCount: UInt64 = 0
     private var failedCount: UInt64 = 0
     private var queuedCount: Int = 0
+    private var queuedMinScore: Double? = nil
+    private var queuedMaxScore: Double? = nil
     private var submitSeq: UInt64 = 0
     private var submitQueue: [SubmissionTask] = []
     private var isSubmitting = false
@@ -449,6 +486,7 @@ final class SubmissionManager: @unchecked Sendable {
     private var backoffScheduled = false
     private let acceptedLock = NSLock()
     private var accepted: [AcceptedSeed] = []
+    private var acceptedBest: [AcceptedSeed] = []
     private let acceptedCapacity = 20
 
     init(
@@ -502,6 +540,30 @@ final class SubmissionManager: @unchecked Sendable {
         return out
     }
 
+    func acceptedBestSnapshot(limit: Int) -> [AcceptedSeed] {
+        acceptedLock.lock()
+        let n = min(max(0, limit), acceptedBest.count)
+        let out = n == 0 ? [] : Array(acceptedBest.prefix(n))
+        acceptedLock.unlock()
+        return out
+    }
+
+    private func updateAcceptedBestLocked(_ entry: AcceptedSeed) {
+        func difficulty(_ e: AcceptedSeed) -> Double {
+            e.difficultyPercentile ?? -1.0
+        }
+        acceptedBest.append(entry)
+        acceptedBest.sort {
+            let da = difficulty($0)
+            let db = difficulty($1)
+            if da != db { return da > db }
+            return $0.score > $1.score
+        }
+        if acceptedBest.count > 3 {
+            acceptedBest.removeLast(acceptedBest.count - 3)
+        }
+    }
+
     func statsSnapshot() -> StatsSnapshot {
         statsLock.lock()
         let snap = StatsSnapshot(
@@ -510,16 +572,39 @@ final class SubmissionManager: @unchecked Sendable {
             rejectedCount: rejectedCount,
             rateLimitedCount: rateLimitedCount,
             failedCount: failedCount,
-            queuedCount: queuedCount
+            queuedCount: queuedCount,
+            queuedMinScore: queuedMinScore,
+            queuedMaxScore: queuedMaxScore
         )
         statsLock.unlock()
         return snap
     }
 
-    private func setQueuedCount(_ count: Int) {
+    private func updateQueueStatsLocked() {
+        let count = submitQueue.count
+        let minScore = submitQueue.last?.score
+        let maxScore = submitQueue.first?.score
         statsLock.lock()
         queuedCount = max(0, count)
+        queuedMinScore = minScore
+        queuedMaxScore = maxScore
         statsLock.unlock()
+    }
+
+    private func pruneQueueLocked(threshold: Double) {
+        guard !submitQueue.isEmpty else { return }
+        var removed = 0
+        submitQueue.removeAll {
+            let drop = $0.score <= threshold || state.isKnown(seed: $0.seed)
+            if drop { removed += 1 }
+            return drop
+        }
+        guard removed > 0 else { return }
+        for _ in 0..<removed {
+            pending.leave()
+        }
+        updateQueueStatsLocked()
+        scheduleJournalWrite()
     }
 
     private func recordSubmitAttempt() {
@@ -559,6 +644,9 @@ final class SubmissionManager: @unchecked Sendable {
                 self.state.mergeTop(top)
                 self.queue.async {
                     self.maybeLoadSubmissionJournal()
+                    let snap = self.state.snapshot()
+                    let threshold = max(self.userMinScore, snap.top500Threshold)
+                    self.pruneQueueLocked(threshold: threshold)
                 }
                 let snap = self.state.snapshot()
                 let why = reason.map { " (\($0))" } ?? ""
@@ -575,7 +663,7 @@ final class SubmissionManager: @unchecked Sendable {
             self.submitSeq &+= 1
             let task = SubmissionTask(seed: seed, score: score, source: source, seq: self.submitSeq)
             self.insertTaskSorted(task)
-            self.setQueuedCount(self.submitQueue.count)
+            self.updateQueueStatsLocked()
             self.scheduleJournalWrite()
             if !self.isSubmitting {
                 self.isSubmitting = true
@@ -624,14 +712,14 @@ final class SubmissionManager: @unchecked Sendable {
         guard !submitQueue.isEmpty else {
             isSubmitting = false
             activeTask = nil
-            setQueuedCount(0)
+            updateQueueStatsLocked()
             scheduleJournalWrite()
             return
         }
 
         let task = submitQueue.removeFirst()
         activeTask = task
-        setQueuedCount(submitQueue.count)
+        updateQueueStatsLocked()
         scheduleJournalWrite()
         Task {
             let outcome = await self.process(task)
@@ -649,7 +737,7 @@ final class SubmissionManager: @unchecked Sendable {
                         self.activeTask = nil
                     }
                     self.insertTaskSorted(task)
-                    self.setQueuedCount(self.submitQueue.count)
+                    self.updateQueueStatsLocked()
                     self.scheduleJournalWrite()
                     self.scheduleBackoff(delay)
                 }
@@ -685,13 +773,24 @@ final class SubmissionManager: @unchecked Sendable {
                 await limiter.recordSuccess()
                 state.markAccepted(seed: task.seed)
                 recordAccepted()
+                let percentile = state.difficultyPercentile(score: task.score)
                 acceptedLock.withLock {
-                    accepted.append(AcceptedSeed(time: Date(), seed: task.seed, score: task.score, rank: res.rank, source: task.source))
+                    let entry = AcceptedSeed(
+                        time: Date(),
+                        seed: task.seed,
+                        score: task.score,
+                        difficultyPercentile: percentile,
+                        rank: res.rank,
+                        source: task.source
+                    )
+                    accepted.append(entry)
                     if accepted.count > acceptedCapacity {
                         accepted.removeFirst(accepted.count - acceptedCapacity)
                     }
+                    updateAcceptedBestLocked(entry)
                 }
-                emit(.accepted, "Accepted seed=\(task.seed) score=\(String(format: "%.6f", task.score)) rank=\(res.rank ?? 0)\(tag)")
+                let pctStr = percentile.map { String(format: " p=%.2f%%", $0 * 100.0) } ?? ""
+                emit(.accepted, "Accepted seed=\(task.seed) score=\(String(format: "%.6f", task.score)) rank=\(res.rank ?? 0)\(pctStr)\(tag)")
                 return .completed
             }
 
@@ -839,7 +938,7 @@ final class SubmissionManager: @unchecked Sendable {
             submitQueue.append(task)
             pending.enter()
         }
-        setQueuedCount(submitQueue.count)
+        updateQueueStatsLocked()
         scheduleJournalWrite()
         queue.async {
             guard !self.submitQueue.isEmpty else { return }

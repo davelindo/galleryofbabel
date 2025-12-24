@@ -205,6 +205,12 @@ final class ExploreLiveUI: @unchecked Sendable {
         lines.append("")
 
         if let submission {
+            func formatAcceptedLine(_ a: SubmissionManager.AcceptedSeed) -> String {
+                let rankStr = a.rank.map { "#\($0)" } ?? "-"
+                let pctStr = a.difficultyPercentile.map { String(format: " p=%.2f%%", $0 * 100.0) } ?? ""
+                return "\(ANSI.green)\(rankStr)\(ANSI.reset) score=\(fmt(a.score)) seed=\(a.seed)\(pctStr)\(a.source.map { " (\($0))" } ?? "")"
+            }
+
             var header = "Accepted (latest)"
             if let submitSnap {
                 let prior = lastSubmitSnap
@@ -213,18 +219,28 @@ final class ExploreLiveUI: @unchecked Sendable {
                 var stats = "acc=\(fmtCount(submitSnap.acceptedCount)) rej=\(fmtCount(submitSnap.rejectedCount)) rate=\(fmtRate(submitRate))/s"
                 if submitSnap.queuedCount > 0 {
                     stats += " queued=\(fmtCount(UInt64(submitSnap.queuedCount)))"
+                    if let minScore = submitSnap.queuedMinScore, let maxScore = submitSnap.queuedMaxScore, minScore.isFinite, maxScore.isFinite {
+                        stats += " range=\(fmt(maxScore))..\(fmt(minScore))"
+                    }
                 }
                 header += " (\(stats))"
                 lastSubmitSnap = submitSnap
             }
             lines.append("\(ANSI.bold)\(header)\(ANSI.reset)")
+            let acceptedBest = submission.acceptedBestSnapshot(limit: 3)
+            if !acceptedBest.isEmpty {
+                lines.append("\(ANSI.gray)best by difficulty\(ANSI.reset)")
+                for a in acceptedBest {
+                    lines.append(truncateANSI(formatAcceptedLine(a), cols: size.cols))
+                }
+                lines.append("")
+            }
             let accepted = submission.acceptedSnapshot(limit: 5)
             if accepted.isEmpty {
                 lines.append("\(ANSI.gray)(none yet)\(ANSI.reset)")
             } else {
                 for a in accepted {
-                    let rankStr = a.rank.map { "#\($0)" } ?? "-"
-                    lines.append(truncateANSI("\(ANSI.green)\(rankStr)\(ANSI.reset) score=\(fmt(a.score)) seed=\(a.seed)\(a.source.map { " (\($0))" } ?? "")", cols: size.cols))
+                    lines.append(truncateANSI(formatAcceptedLine(a), cols: size.cols))
                 }
             }
             lines.append("")
