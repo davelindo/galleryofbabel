@@ -141,8 +141,12 @@ final class ExploreLiveUI: @unchecked Sendable {
         let cpuEta = etaString(rate: cpuRate, meanStd: cpuMeanStd, threshold: thr)
         let margin = ctx.mpsVerifyMargin.current()
         let shift = ctx.mpsScoreShift.current()
-        let approxGate = thr - margin - shift
-        let mpsEta = etaString(rate: mpsRate, meanStd: mpsMeanStd, threshold: approxGate)
+        let bestTarget: Double = {
+            if bestSnap.score.isFinite { return bestSnap.score }
+            if approxSnap.score.isFinite { return Double(approxSnap.score) }
+            return .nan
+        }()
+        let mpsEta = etaString(rate: mpsRate, meanStd: mpsMeanStd, threshold: bestTarget)
 
         var lines: [String] = []
         lines.reserveCapacity(size.rows)
@@ -182,7 +186,7 @@ final class ExploreLiveUI: @unchecked Sendable {
 
         if ctx.backend == .mps || ctx.backend == .all {
             let meanStr = mpsMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
-            let etaStr = mpsEta.map { "ETA(gate)≈\($0)" } ?? "ETA(gate)=?"
+            let etaStr = mpsEta.map { "ETA(best)≈\($0)" } ?? "ETA(best)=?"
             lines.append(truncateANSI("\(ANSI.magenta)MPS\(ANSI.reset)  \(fmtCount(snap.mpsCount))  \(fmtRate(mpsRate))/s  \(meanStr)  \(etaStr)", cols: size.cols))
             let meanVerify = cpuVerifyMeanStd.map { "avg=\(fmt($0.mean)) σ=\(fmt($0.std))" } ?? "avg=?"
             lines.append(truncateANSI("\(ANSI.green)CPUv\(ANSI.reset)  \(fmtCount(snap.cpuVerifyCount))  \(fmtRate(cpuVerifyRate))/s  \(meanVerify)", cols: size.cols))

@@ -226,12 +226,10 @@ final class SubmissionState: @unchecked Sendable {
         let top500Threshold: Double
         let lastRefresh: Date
         let knownCount: Int
-        let attemptedCount: Int
     }
 
     private let lock = NSLock()
     private var knownSeeds = Set<UInt64>()
-    private var attemptedSeeds = Set<UInt64>()
     private var topScores: [Double] = []
     private var top500Threshold: Double = -Double.infinity
     private var lastRefresh: Date = .distantPast
@@ -264,15 +262,7 @@ final class SubmissionState: @unchecked Sendable {
         let threshold = max(userMinScore, top500Threshold)
         guard score > threshold else { return false }
         if knownSeeds.contains(seed) { return false }
-        if attemptedSeeds.contains(seed) { return false }
-        attemptedSeeds.insert(seed)
         return true
-    }
-
-    func markAttempted(seed: UInt64) {
-        lock.lock()
-        attemptedSeeds.insert(seed)
-        lock.unlock()
     }
 
     func isKnown(seed: UInt64) -> Bool {
@@ -308,7 +298,6 @@ final class SubmissionState: @unchecked Sendable {
     func markAccepted(seed: UInt64) {
         lock.lock()
         knownSeeds.insert(seed)
-        attemptedSeeds.insert(seed)
         lock.unlock()
     }
 
@@ -317,8 +306,7 @@ final class SubmissionState: @unchecked Sendable {
         let s = Snapshot(
             top500Threshold: top500Threshold,
             lastRefresh: lastRefresh,
-            knownCount: knownSeeds.count,
-            attemptedCount: attemptedSeeds.count
+            knownCount: knownSeeds.count
         )
         lock.unlock()
         return s

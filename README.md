@@ -17,6 +17,16 @@ It features a dual-backend architecture:
 *   **State Management:** Tracks exploration progress to prevent re-scanning the same seed ranges.
 *   **Live Submission:** Automatically submits qualifying seeds to the Gallery of Babel API.
 
+## Performance
+
+| Hardware | Device ID | Backend | Throughput | Power | Efficiency | Best Score | Rarity |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **2.04M seeds/s** | ~40W | **183.4M seeds/Wh** | `-8.504137` | ~1 in 5.99e11 |
+
+*Efficiency calculated as (Seeds per Second * 3600) / Watts. Rarity estimated from /api/stats total generations at time of run (score ≥ current #1).*
+
+> **Note:** Please open a PR to add your hardware and findings!
+
 ## Requirements
 
 *   **OS:** macOS 14.0+ (Requires Metal and Accelerate frameworks).
