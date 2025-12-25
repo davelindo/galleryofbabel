@@ -38,8 +38,8 @@ It features a dual-backend architecture:
 Clone the repository and build using Swift Package Manager:
 
 ```bash
-git clone https://github.com/your-repo/gobx.git
-cd gobx
+git clone https://github.com/davelindo/galleryofbabel.git
+cd galleryofbabel
 swift build -c release
 cp .build/release/gobx /usr/local/bin/
 ```
