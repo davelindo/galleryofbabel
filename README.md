@@ -2,17 +2,17 @@
 
 **gobx** is a high-performance, native explorer and scorer for the [Gallery of Babel](https://www.echohive.ai/gallery-of-babel/).
 
-This repo is a small exploration into using GPU proxies (MPSGraph and a fused Metal kernel) for brute-force search over a deterministic noise field, based on the scoring ideas described in:
+This repo is a small exploration into using a fused Metal GPU proxy for brute-force search over a deterministic noise field, based on the scoring ideas described in:
 - https://www.echohive.ai/gallery-of-babel/how-it-works
 
 It features a dual-backend architecture:
 *   **CPU:** Reference implementation using Apple's **Accelerate** framework (vDSP/LinearAlgebra) for maximum precision.
-*   **GPU:** High-throughput approximation on Apple Silicon. The default Metal path uses a fused 2x2 pyramid kernel that keeps intermediate tiles in threadgroup memory (no full image writes), enabling up to ~20x speedups vs the older FFT/MPSGraph proxy on supported hardware. MPSGraph remains available as a fallback.
+*   **Metal GPU:** High-throughput approximation on Apple Silicon. The fused 2x2 pyramid kernel keeps intermediate tiles in threadgroup memory (no full image writes), enabling up to ~20x speedups vs the older FFT proxy on supported hardware.
 
 ## Features
 
-*   **Hybrid Mining:** Uses GPU (MPS) for wide-net searching and CPU for precise verification.
-*   **Adaptive MPS Tuning:** Auto-tunes batch size and margin for throughput and accuracy.
+*   **Hybrid Mining:** Uses the Metal GPU for wide-net searching and CPU for precise verification.
+*   **Adaptive GPU Tuning:** Auto-tunes batch size and margin for throughput and accuracy.
 *   **Automated Calibration:** Tools to tune GPU scoring thresholds against CPU ground truth for your specific hardware.
 *   **State Management:** Tracks exploration progress to prevent re-scanning the same seed ranges.
 *   **Live Submission:** Automatically submits qualifying seeds to the Gallery of Babel API.
@@ -30,7 +30,7 @@ It features a dual-backend architecture:
 ## Requirements
 
 *   **OS:** macOS 14.0+ (Requires Metal and Accelerate frameworks).
-*   **Hardware:** Apple Silicon (M1/M2/M3) recommended for MPS performance.
+*   **Hardware:** Apple Silicon (M1/M2/M3/M4) recommended for Metal performance.
 *   **Build:** Swift 6.0+.
 
 ## Installation
@@ -85,8 +85,8 @@ gobx explore --endless
 # Force CPU-only
 gobx explore --backend cpu --endless
 
-# Run with a specific batch size
-gobx explore --backend mps --batch 192 --mps-inflight 2
+# Run with a specific batch size (Metal GPU)
+gobx explore --backend mps --gpu-backend metal --batch 192 --mps-inflight 2
 ```
 
 Defaults:
@@ -101,16 +101,16 @@ Verify the score of a known seed.
 gobx score 123456789
 
 # GPU (Approximate)
-gobx score 123456789 --backend mps
+gobx score 123456789 --backend mps --gpu-backend metal
 ```
 
 ### 3. Calibration
-Because floating-point operations differ between CPU and GPU, the GPU scorer is an approximation. Calibration ensures you don't discard valid seeds or submit invalid ones.
+Because floating-point operations differ between CPU and GPU, the Metal scorer is an approximation. Calibration ensures you don't discard valid seeds or submit invalid ones.
 
-**Step 1: Calibrate MPS vs CPU**
+**Step 1: Calibrate Metal vs CPU**
 Scans random seeds to find the scoring delta between GPU and CPU.
 ```bash
-gobx calibrate-mps --scan 1000000
+gobx calibrate-metal --scan 1000000
 ```
 
 *These commands write calibration files to `~/.config/gallery-of-babel/` which `gobx explore` automatically loads.*
@@ -119,8 +119,8 @@ gobx calibrate-mps --scan 1000000
 Measure your hardware's throughput.
 
 ```bash
-# Benchmark MPS performance across various batch sizes
-gobx bench-mps --seconds 5 --warmup 2
+# Benchmark Metal performance across various batch sizes
+gobx bench-metal --seconds 5 --warmup 2
 ```
 
 ### 5. Self-Test
@@ -143,5 +143,5 @@ gobx selftest
 ## Troubleshooting
 
 *   **Crashes:** If `gobx` crashes, a custom crash reporter will print a backtrace. Set `GOBX_NO_CRASH_REPORTER=1` to disable this.
-*   **Calibration Warnings:** If you see "No valid MPS calibration found", run the calibration commands listed above.
+*   **Calibration Warnings:** If you see "No valid Metal calibration found", run the calibration commands listed above.
 *   **State Reset:** If you want to restart exploration from a random location, pass `--state-reset` to the explore command.
