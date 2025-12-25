@@ -229,7 +229,10 @@ final class SubmissionState: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var knownSeeds = Set<UInt64>()
+    private var topSeeds = Set<UInt64>()
+    private var acceptedSeeds = Set<UInt64>()
+    private var acceptedOrder: [UInt64] = []
+    private let acceptedCap: Int = 4096
     private var topScores: [Double] = []
     private var top500Threshold: Double = -Double.infinity
     private var lastRefresh: Date = .distantPast
@@ -237,9 +240,9 @@ final class SubmissionState: @unchecked Sendable {
     func mergeTop(_ top: TopResponse) {
         lock.lock()
         topScores = top.images.map { $0.score }.sorted(by: >)
-        for img in top.images {
-            knownSeeds.insert(img.seed)
-        }
+        topSeeds.removeAll(keepingCapacity: true)
+        topSeeds.reserveCapacity(top.images.count)
+        for img in top.images { topSeeds.insert(img.seed) }
         if let last = topScores.last {
             top500Threshold = last
         }
@@ -261,13 +264,13 @@ final class SubmissionState: @unchecked Sendable {
         guard top500Threshold.isFinite else { return false }
         let threshold = max(userMinScore, top500Threshold)
         guard score > threshold else { return false }
-        if knownSeeds.contains(seed) { return false }
+        if topSeeds.contains(seed) || acceptedSeeds.contains(seed) { return false }
         return true
     }
 
     func isKnown(seed: UInt64) -> Bool {
         lock.lock()
-        let known = knownSeeds.contains(seed)
+        let known = topSeeds.contains(seed) || acceptedSeeds.contains(seed)
         lock.unlock()
         return known
     }
@@ -297,16 +300,32 @@ final class SubmissionState: @unchecked Sendable {
 
     func markAccepted(seed: UInt64) {
         lock.lock()
-        knownSeeds.insert(seed)
+        if !acceptedSeeds.contains(seed) {
+            acceptedSeeds.insert(seed)
+            acceptedOrder.append(seed)
+            if acceptedOrder.count > acceptedCap {
+                let dropCount = acceptedOrder.count - acceptedCap
+                for i in 0..<dropCount {
+                    acceptedSeeds.remove(acceptedOrder[i])
+                }
+                acceptedOrder.removeFirst(dropCount)
+            }
+        }
         lock.unlock()
     }
 
     func snapshot() -> Snapshot {
         lock.lock()
+        var knownCount = topSeeds.count
+        if !acceptedSeeds.isEmpty {
+            for seed in acceptedSeeds where !topSeeds.contains(seed) {
+                knownCount += 1
+            }
+        }
         let s = Snapshot(
             top500Threshold: top500Threshold,
             lastRefresh: lastRefresh,
-            knownCount: knownSeeds.count
+            knownCount: knownCount
         )
         lock.unlock()
         return s
@@ -1248,7 +1267,10 @@ final class CandidateVerifier: @unchecked Sendable {
     }
 
     private func process(_ task: VerifyTask) {
-        defer { pending.leave() }
+        defer {
+            pending.leave()
+            _ = seenLock.withLock { seenSeeds.remove(task.seed) }
+        }
 
         let exact = scorer.score(seed: task.seed).totalScore
         stats.addCPUVerify(count: 1, scoreSum: exact, scoreSumSq: exact * exact)
