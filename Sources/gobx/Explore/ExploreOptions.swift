@@ -24,6 +24,8 @@ struct ExploreOptions {
     var reportEverySec: Double = 1.0
     var uiEnabled: Bool? = nil
     var setupConfig: Bool = false
+    var statsEnabled: Bool? = nil
+    var statsUrl: String? = nil
     var memGuardMaxGB: Double = 0.0
     var memGuardMaxFrac: Double = 0.0
     var memGuardMaxGBSpecified: Bool = false
@@ -107,6 +109,12 @@ extension ExploreOptions {
                 o.uiEnabled = false
             case "--setup":
                 o.setupConfig = true
+            case "--stats":
+                o.statsEnabled = true
+            case "--no-stats":
+                o.statsEnabled = false
+            case "--stats-url":
+                o.statsUrl = try parser.requireValue(for: "--stats-url")
             case "--mem-guard-gb":
                 o.memGuardMaxGB = max(0.0, try parser.requireDouble(for: "--mem-guard-gb"))
                 o.memGuardMaxGBSpecified = true

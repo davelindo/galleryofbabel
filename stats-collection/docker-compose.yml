@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  stats:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      - STATS_DB_PATH=/data/stats.db
+    volumes:
+      - ./data:/data

@@ -7,6 +7,7 @@ import FoundationNetworking
 struct AppConfig: Codable {
     let baseUrl: String?
     let profile: Profile?
+    let stats: StatsConfig?
 
     struct Profile: Codable {
         let id: String
@@ -18,6 +19,11 @@ struct AppConfig: Codable {
             name: "DreamingDragon588",
             xProfile: "davelindon10"
         )
+    }
+
+    struct StatsConfig: Codable {
+        let enabled: Bool
+        let url: String?
     }
 }
 

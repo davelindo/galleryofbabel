@@ -17,6 +17,7 @@ Usage:
               [--batch <n>] [--backend cpu|mps|all] [--gpu-backend mps|metal] [--top <n>]
               [--submit] [--top-unique-users] [--min-score <x>] [--refresh-every <sec>]
               [--report-every <sec>] [--ui|--no-ui] [--setup]
+              [--stats|--no-stats] [--stats-url <url>]
               [--mem-guard-gb <n>] [--mem-guard-frac <f>] [--mem-guard-every <sec>]
               [--mps-margin <x>] [--mps-margin-auto] [--mps-inflight <n>] [--mps-inflight-auto]
               [--mps-inflight-min <n>] [--mps-inflight-max <n>] [--mps-workers <n>] [--mps-reinit-every <sec>]
@@ -43,5 +44,6 @@ Notes:
   - When no config is found, `explore` offers an interactive first-run setup and optional calibration.
   - Use `--setup` to launch the interactive setup even if a config already exists.
   - Use `gobx --setup` to run setup without starting an explore session.
+  - Anonymous performance stats are collected only when enabled in config or via `--stats`.
   - Set `GOBX_NO_CRASH_REPORTER=1` to disable fatal-signal backtraces.
 """

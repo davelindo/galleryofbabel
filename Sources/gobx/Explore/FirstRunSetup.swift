@@ -56,7 +56,12 @@ enum FirstRunSetup {
             }
         }
 
-        let config = AppConfig(baseUrl: baseUrl, profile: profile)
+        let wantsStats = promptYesNo("Share anonymized performance stats?", defaultValue: false)
+        let statsConfig = AppConfig.StatsConfig(
+            enabled: wantsStats,
+            url: wantsStats ? StatsCollector.defaultURL : nil
+        )
+        let config = AppConfig(baseUrl: baseUrl, profile: profile, stats: statsConfig)
         guard confirmWrite(to: configURL, emit: emit) else { return nil }
         do {
             try saveConfig(config, to: configURL)

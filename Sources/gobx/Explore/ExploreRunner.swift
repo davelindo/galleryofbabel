@@ -50,6 +50,8 @@ enum ExploreRunner {
         let stateWriteEverySec = options.stateWriteEverySec
         let claimSize = options.claimSize
         let uiEnabledArg = options.uiEnabled
+        let statsEnabledOption = options.statsEnabled
+        let statsUrlOption = options.statsUrl
         let memGuardMaxGB = options.memGuardMaxGB
         let memGuardMaxFrac = options.memGuardMaxFrac
         let memGuardMaxGBSpecified = options.memGuardMaxGBSpecified
@@ -479,6 +481,18 @@ enum ExploreRunner {
             }
         }
 
+        let statsConsent: Bool = {
+            if let flag = statsEnabledOption { return flag }
+            if statsUrlOption != nil { return true }
+            return config?.stats?.enabled ?? false
+        }()
+        let statsUrl: String? = {
+            guard statsConsent else { return nil }
+            if let url = statsUrlOption { return url }
+            if let url = config?.stats?.url { return url }
+            return StatsCollector.defaultURL
+        }()
+
         var submission: SubmissionManager? = nil
         var refreshTimer: DispatchSourceTimer? = nil
 
@@ -489,13 +503,13 @@ enum ExploreRunner {
                     if cfg.profile == nil {
                         let handle = defaultProfile.xProfile.map { "@\($0)" } ?? "(none)"
                         emit(.warning, "No profile configured at \(GobxPaths.configURL.path); using default author profile id=\(defaultProfile.id) name=\(defaultProfile.name) x=\(handle)")
-                        return AppConfig(baseUrl: cfg.baseUrl, profile: defaultProfile)
+                        return AppConfig(baseUrl: cfg.baseUrl, profile: defaultProfile, stats: cfg.stats)
                     }
                     return cfg
                 }
                 let handle = defaultProfile.xProfile.map { "@\($0)" } ?? "(none)"
                 emit(.warning, "No config found at \(GobxPaths.configURL.path); using default author profile id=\(defaultProfile.id) name=\(defaultProfile.name) x=\(handle)")
-                return AppConfig(baseUrl: nil, profile: defaultProfile)
+                return AppConfig(baseUrl: nil, profile: defaultProfile, stats: nil)
             }()
 
             let state = SubmissionState()
@@ -888,5 +902,35 @@ enum ExploreRunner {
                              bestFinal.score, bestFinal.seed, bestFinal.tag)
         }
         logPrint(summary)
+
+        if statsConsent, let statsUrl {
+            let statsBatch: Int? = (resolvedBackendFinal == .cpu) ? nil : mpsBatch
+            let statsInflight: Int? = (resolvedBackendFinal == .cpu) ? nil : mpsInflightStart
+            let metrics = StatsCollector.Metrics(
+                backend: resolvedBackendFinal,
+                gpuBackend: gpuBackend,
+                batch: statsBatch,
+                inflight: statsInflight,
+                batchMin: mpsBatchAutoFinal && resolvedBackendFinal != .cpu ? mpsBatchMinFinal : nil,
+                batchMax: mpsBatchAutoFinal && resolvedBackendFinal != .cpu ? mpsBatchMaxFinal : nil,
+                inflightMin: mpsInflightAutoSnapshot && resolvedBackendFinal != .cpu ? mpsInflightMinSnapshot : nil,
+                inflightMax: mpsInflightAutoSnapshot && resolvedBackendFinal != .cpu ? mpsInflightMaxSnapshot : nil,
+                autoBatch: mpsBatchAutoFinal && resolvedBackendFinal != .cpu,
+                autoInflight: mpsInflightAutoSnapshot && resolvedBackendFinal != .cpu,
+                elapsedSec: dt,
+                totalCount: totalCount,
+                totalRate: totalRate,
+                cpuRate: cpuRate,
+                gpuRate: mpsRate,
+                cpuAvg: cpuAvg,
+                gpuAvg: mpsAvg
+            )
+            if let payload = StatsCollector.makePayload(metrics: metrics) {
+                let ok = await StatsCollector.send(payload: payload, url: statsUrl)
+                if !ok {
+                    emit(.warning, "Anonymous stats upload failed (url=\(statsUrl))")
+                }
+            }
+        }
     }
 }

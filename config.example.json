@@ -4,5 +4,9 @@
     "id": "user_…",
     "name": "YourName",
     "xProfile": "your_x_handle"
+  },
+  "stats": {
+    "enabled": false,
+    "url": "https://gobx-stats.davelindon.me/ingest"
   }
 }
