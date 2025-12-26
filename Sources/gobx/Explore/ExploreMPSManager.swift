@@ -294,7 +294,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         var batch = max(1, p.mpsBatch)
         let autoEnabled = p.mpsBatchAuto
         let batchMin = autoEnabled ? max(1, p.mpsBatchMin) : batch
-        let batchMax = autoEnabled ? max(batchMin, p.mpsBatchMax) : batch
+        var batchMax = autoEnabled ? max(batchMin, p.mpsBatchMax) : batch
         let tuneInterval = tuneIntervalNs()
         let tuneLabel = "GPU autotune"
         let inflightTuneInterval: UInt64 = {
@@ -303,7 +303,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         }()
         let inflightAuto = p.mpsInflightAuto
         let inflightMin = inflightAuto ? max(1, p.mpsInflightMin) : inflight
-        let inflightMax = inflightAuto ? max(inflightMin, p.mpsInflightMax) : inflight
+        var inflightMax = inflightAuto ? max(inflightMin, p.mpsInflightMax) : inflight
         if inflight < inflightMin { inflight = inflightMin }
         if inflight > inflightMax { inflight = inflightMax }
         let processingWorkers = max(1, p.mpsWorkers)
@@ -549,6 +549,8 @@ final class ExploreMPSManager: @unchecked Sendable {
         var enqueued = 0
         var completed = 0
         var seeds = [UInt64](repeating: 0, count: batch)
+        var retiredScorers: [any GPUScorer] = []
+        let maxRetiredScorers = 2
 
         var lastReinitNs = DispatchTime.now().uptimeNanoseconds
         var reinitCheck = 0
@@ -581,6 +583,8 @@ final class ExploreMPSManager: @unchecked Sendable {
         let inflightDropFactor = 0.98
         let inflightWarmupIntervals = 1
         var inflightWarmupRemaining = inflightAuto ? inflightWarmupIntervals : 0
+        var recoveryAttempts = 0
+        let maxRecoveryAttempts = 3
 
         func currentStep() -> (up: Double, down: Double) {
             tuneStepLevels[tuneLevel]
@@ -604,7 +608,12 @@ final class ExploreMPSManager: @unchecked Sendable {
             emit(.info, "Reinitializing GPU scorer (\(reason), batch=\(newBatch) inflight=\(newInflight))…")
             do {
                 guard let makeScorer = p.makeScorer else { return }
+                let oldScorer = scorer
                 scorer = try makeScorer(newBatch, newInflight)
+                retiredScorers.append(oldScorer)
+                if retiredScorers.count > maxRetiredScorers {
+                    retiredScorers.removeFirst(retiredScorers.count - maxRetiredScorers)
+                }
                 batch = newBatch
                 inflight = newInflight
                 seeds = [UInt64](repeating: 0, count: batch)
@@ -616,6 +625,64 @@ final class ExploreMPSManager: @unchecked Sendable {
             } catch {
                 emit(.warning, "Warning: GPU reinit failed: \(error)")
             }
+        }
+
+        func resetTuningState(now: UInt64) {
+            tuneLevel = 0
+            tuneDirection = 1
+            tuneDirectionChanges = 0
+            tuneSettled = !autoEnabled
+            lastTuneRate = nil
+            bestTuneRate = nil
+            bestTuneBatch = batch
+            tuneWarmupRemaining = autoEnabled ? tuneWarmupIntervals : 0
+            pendingTune = nil
+            lastTuneNs = now
+            lastTuneCompleted = completed
+
+            inflightTuneSettled = !inflightAuto || inflightMin == inflightMax
+            inflightLastRate = nil
+            inflightBestRate = nil
+            inflightBest = inflight
+            inflightDirection = 1
+            inflightDirectionChanges = 0
+            inflightWarmupRemaining = inflightAuto ? inflightWarmupIntervals : 0
+            inflightLastTuneNs = now
+            inflightLastCompleted = completed
+        }
+
+        func isTimeoutError(_ error: Error) -> Bool {
+            if let mpsError = error as? MPSScorerError, case .commandTimeout = mpsError {
+                return true
+            }
+            if let metalError = error as? MetalPyramidScorerError, case .commandTimeout = metalError {
+                return true
+            }
+            return false
+        }
+
+        func recoverFromError(_ error: Error) -> Bool {
+            guard let _ = p.makeScorer else { return false }
+            guard recoveryAttempts < maxRecoveryAttempts else { return false }
+
+            recoveryAttempts += 1
+            let now = DispatchTime.now().uptimeNanoseconds
+            let isTimeout = isTimeoutError(error)
+            let scale = (recoveryAttempts >= 2 || isTimeout) ? 0.5 : 0.7
+            let targetBatch = max(batchMin, Int(Double(batch) * scale))
+            let nextBatch = min(batchMax, max(batchMin, targetBatch))
+            let nextInflight = max(inflightMin, min(inflight, 2))
+
+            batchMax = min(batchMax, nextBatch)
+            inflightMax = min(inflightMax, nextInflight)
+
+            let label = isTimeout ? "timeout" : "error"
+            emit(.warning, "Warning: GPU run \(label) (\(error)); reinitializing with batch=\(nextBatch) inflight=\(nextInflight)")
+            enqueued = completed
+            pending.removeAll(keepingCapacity: true)
+            rebuildScorer(newBatch: nextBatch, newInflight: nextInflight, reason: "recovery")
+            resetTuningState(now: now)
+            return true
         }
 
         if autoEnabled {
@@ -843,11 +910,15 @@ final class ExploreMPSManager: @unchecked Sendable {
                 try scorer.withCompletedJob(job) { seedsBuf, scoresBuf in
                     processBatch(seedsBuf: seedsBuf, scoresBuf: scoresBuf, count: job.count)
                 }
+                completed += job.count
+                recoveryAttempts = 0
             } catch {
-                emit(.warning, "Warning: MPS run error: \(error)")
-                p.stop.requestStop()
+                let recovered = recoverFromError(error)
+                if !recovered {
+                    emit(.warning, "Warning: MPS run error: \(error)")
+                    p.stop.requestStop()
+                }
             }
-            completed += job.count
             return true
         }
 
