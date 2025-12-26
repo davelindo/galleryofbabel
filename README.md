@@ -2,21 +2,22 @@
 
 **gobx** is a high-performance, native explorer and scorer for the [Gallery of Babel](https://www.echohive.ai/gallery-of-babel/).
 
-This repo is a small exploration into using a fused Metal GPU proxy for brute-force search over a deterministic noise field, based on the scoring ideas described in:
-- https://www.echohive.ai/gallery-of-babel/how-it-works
-
-It features a dual-backend architecture:
-*   **CPU:** Reference implementation using Apple's **Accelerate** framework (vDSP/LinearAlgebra) for maximum precision.
-*   **Metal GPU:** High-throughput approximation on Apple Silicon. The fused 2x2 pyramid kernel keeps intermediate tiles in threadgroup memory (no full image writes), enabling up to ~20x speedups vs the older FFT proxy on supported hardware.
+It is a native Swift application built for Apple Silicon, using a dual-backend architecture to maximize throughput while maintaining scoring precision. It achieves state-of-the-art search speeds by using a custom fused Metal compute kernel to approximate image statistics without performing a full FFT on the GPU.
 
 ## Features
 
-*   **Hybrid Mining:** Uses the Metal GPU for wide-net searching and CPU for precise verification.
-*   **Adaptive GPU Tuning:** Auto-tunes batch size, inflight depth, and margin for throughput and accuracy.
-*   **Automated Calibration:** Tools to tune GPU scoring thresholds against CPU ground truth for your specific hardware.
-*   **State Management:** Tracks exploration progress to prevent re-scanning the same seed ranges.
-*   **Live Submission:** Automatically submits qualifying seeds to the Gallery of Babel API.
-*   **Optional Stats:** Opt-in, anonymized performance stats collection.
+*   **Hybrid Search Architecture**
+    *   **GPU (Metal):** Uses a fused "Pyramid Proxy" kernel (`MetalPyramidScorer`) to estimate variance and spectral properties at multi-million seeds/s on M-series hardware.
+    *   **CPU (Accelerate):** Uses vDSP/LinearAlgebra for exact verification of promising candidates found by the GPU.
+*   **Adaptive Tuning**
+    *   **Batch & Inflight:** Automatically adjusts batch sizes and command buffer saturation to maximize GPU utilization.
+    *   **Dynamic Margins:** Continuously tunes the GPU/CPU scoring margin to balance false positives vs false negatives.
+*   **Resilience**
+    *   **Memory Guards:** Monitors `phys_footprint` and stops before hitting macOS memory limits (Jetsam).
+    *   **State Management:** Journaled progress tracking (`gobx-seed-state.json`) allows pausing and resuming without re-scanning seeds.
+*   **Live Dashboard:** Interactive, htop-style terminal UI showing real-time throughput and tuning metrics.
+*   **Automated Submission:** Automatically submits qualifying seeds to the Gallery of Babel API.
+*   **Optional Stats:** Opt-in, anonymized performance metrics (every 60s and at exit).
 
 ## Performance
 
@@ -25,9 +26,9 @@ It features a dual-backend architecture:
 | 2025-12-26 | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **4,779,931 seeds/s** | ~46W | **374.1M seeds/Wh** |
 | n/a | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **2.04M seeds/s** | ~40W | **183.4M seeds/Wh** |
 
-*Efficiency calculated as (Seeds per Second * 3600) / Watts.*
+*Efficiency calculated as (Seeds per Second * 3600) / Watts. Throughput depends on `mps-margin` and verification rate.*
 
-> **Note:** Please open a PR to add your hardware and findings!
+> **Note:** Please open a PR to add your hardware and findings.
 
 ## Results
 
@@ -35,34 +36,25 @@ This approach reached the #1 spot on the Gallery of Babel leaderboard.
 
 ## Requirements
 
-*   **OS:** macOS 14.0+ (Requires Metal and Accelerate frameworks).
-*   **Hardware:** Apple Silicon (M1/M2/M3/M4/M5) recommended for Metal performance.
+*   **OS:** macOS 14.0+ (Sonoma or Sequoia).
+*   **Hardware:** Apple Silicon (M1/M2/M3/M4/M5) strongly recommended.
 *   **Build:** Swift 6.0+.
 *   **Tooling:** Xcode Command Line Tools (or full Xcode) for Swift/SwiftPM (`xcode-select --install`).
 
 ## Installation
 
-Clone the repository and build using Swift Package Manager:
+### 1. Build from Source
 
 ```bash
 git clone https://github.com/davelindo/galleryofbabel.git
 cd galleryofbabel
-swift build -c release
-cp .build/release/gobx /usr/local/bin/
-```
-
-Now just run `gobx explore` and let the setup wizard configure things if needed:
-
-```bash
-gobx explore
-```
-
-By default, `gobx explore` runs endlessly until you stop it. Use `--count` for a finite run.
-
-If you're running in a sandboxed environment (or just want a clean build output), use:
-
-```bash
 make build
+```
+
+The binary will be located at `.build/release/gobx`. You can copy this to your path:
+
+```bash
+cp .build/release/gobx /usr/local/bin/
 ```
 
 If SwiftPM sandboxing is blocked on your system, add:
@@ -71,14 +63,37 @@ If SwiftPM sandboxing is blocked on your system, add:
 make build SWIFT_BUILD_FLAGS=--disable-sandbox
 ```
 
+### 2. First Run and Setup
+
+Run the tool in exploration mode. It will detect a missing configuration and launch an interactive wizard to set up your profile and optional telemetry.
+
+```bash
+gobx explore
+```
+
+By default, `gobx explore` runs endlessly until you stop it. Use `--count` for a finite run.
+
+Example wizard run:
+
+```text
+No config found at /Users/you/.config/gallery-of-babel/config.json. Run first-time setup now? [Y/n]
+Configure submission profile now? [Y/n]
+Profile id [user_abcd1234_xyz987654]:
+Display name [Cosmic-Explorer-AB12]:
+X handle (optional, without @):
+Share anonymized performance stats? [y/N]
+Write config to /Users/you/.config/gallery-of-babel/config.json? [Y/n]
+Wrote config to /Users/you/.config/gallery-of-babel/config.json
+```
+
 ## Configuration
 
-If you want to configure manually (instead of using the setup wizard), create a configuration file at `~/.config/gallery-of-babel/config.json`:
+Configuration is stored in `~/.config/gallery-of-babel/config.json`.
 
 ```json
 {
   "profile": {
-    "id": "YOUR_UUID_HERE",
+    "id": "user_...",
     "name": "YourDisplayname",
     "xProfile": "yourhandle"
   },
@@ -89,44 +104,30 @@ If you want to configure manually (instead of using the setup wizard), create a 
 }
 ```
 
-If no profile is configured, `gobx explore` will fall back to the default author profile for submissions.
-
-On first run, `gobx explore` will offer an interactive setup to create this file and optionally run GPU calibration if no config exists.
-You can re-run the setup later with `gobx --setup` or `gobx explore --setup`.
-
-Example wizard run:
-
-```text
-No config found at /Users/you/.config/gallery-of-babel/config.json. Run first-time setup now? [Y/n]
-Configure submission profile now? [Y/n]
-Profile id [user_abcd1234_xyz987654]: 
-Display name [Cosmic-Explorer-AB12]:
-X handle (optional, without @):
-Share anonymized performance stats? [y/N]
-Write config to /Users/you/.config/gallery-of-babel/config.json? [Y/n]
-Wrote config to /Users/you/.config/gallery-of-babel/config.json
-```
-
-### Optional Anonymous Stats
-If you opt in, `gobx explore` sends anonymized performance metrics every 60s and once at exit.
-Use `--stats`/`--no-stats` and `--stats-url` to override config values.
-See `stats-collection/` for a minimal FastAPI + SQLite collector.
+*   **Profile:** Used for leaderboard submissions.
+*   **Stats:** Optional opt-in for anonymized performance telemetry.
 
 ## Usage
 
-### 1. Exploration (Mining)
-The main command to search for seeds. By default, it uses the GPU backend when available and submits results.
+### Exploration (Mining)
+The primary mode is `explore`. It defaults to using the Metal backend with adaptive batching.
 
 ```bash
-# Run exploration (uses GPU if available, otherwise CPU)
+# Run indefinitely (Ctrl+C to stop)
 gobx explore
 
-# Force CPU-only
-gobx explore --backend cpu --endless
+# Run for a specific number of seeds
+gobx explore --count 10000000
 
-# Run with a specific batch size (Metal GPU)
-gobx explore --backend mps --gpu-backend metal --batch 192 --mps-inflight 2
+# Force specific tuning parameters (disables auto-tuning)
+gobx explore --batch 256 --mps-inflight 2
 ```
+
+**Common Flags:**
+*   `--endless`: Explicitly run forever (default if count is omitted).
+*   `--no-ui`: Disable the dashboard (useful for logging to files).
+*   `--mem-guard-gb <n>`: Stop if memory usage exceeds N GB.
+*   `--state-reset`: Restart search from a random location in the seed space.
 
 Defaults:
 - Metal available: `--backend mps --gpu-backend metal --submit --mps-batch-auto --mps-inflight-auto --mps-margin-auto --top-unique-users`
@@ -137,55 +138,53 @@ Device tuning seeds (used only before a per-device cache exists):
 - M3/M4/M5: batch 320, inflight 2
 Cached values are stored in `~/.config/gallery-of-babel/gobx-gpu-tuning.json`.
 
-### 2. Scoring a Specific Seed
-Verify the score of a known seed.
+### Benchmarking
+Measure raw throughput without verification overhead.
 
 ```bash
-# CPU (Exact)
+# Sweep common batch sizes
+gobx bench-metal
+
+# Benchmark specific parameters
+gobx bench-metal --size 128 --tg 192 --batches 256,512 --seconds 10
+```
+
+### Calibration
+The Metal proxy provides an approximation of the score. Calibration scans random seeds to determine the statistical error margin between the GPU and CPU scorers, ensuring you do not miss high-scoring seeds.
+
+```bash
+gobx calibrate-metal --scan 2000000
+```
+
+*Note: `gobx explore` loads these calibration values automatically.*
+
+### Verification
+Check the exact score of a specific seed using the CPU reference implementation.
+
+```bash
 gobx score 123456789
-
-# GPU (Approximate)
-gobx score 123456789 --backend mps --gpu-backend metal
 ```
 
-### 3. Calibration
-Because floating-point operations differ between CPU and GPU, the Metal scorer is an approximation. Calibration ensures you don't discard valid seeds or submit invalid ones.
+## Architecture details
 
-**Step 1: Calibrate Metal vs CPU**
-Scans random seeds to find the scoring delta between GPU and CPU.
-```bash
-gobx calibrate-metal --scan 1000000
-```
+### The Scoring Function
+The tool evaluates 128x128 monochrome images generated from a 64-bit seed using Mulberry32 RNG. The score is a weighted sum of:
+1.  **Alpha:** The slope of the power spectrum (log-log), targeting -3.0.
+2.  **Peakiness:** Ratio of max power to geometric mean in the mid-frequency ring.
+3.  **Flatness:** Spectral flatness measure.
+4.  **Neighbor Correlation:** Pixel-wise spatial coherence.
 
-*These commands write calibration files to `~/.config/gallery-of-babel/` which `gobx explore` automatically loads.*
+### The Metal Pyramid Proxy
+Calculating a full 2D FFT for every seed is expensive. `gobx` uses a custom Metal kernel (`PyramidProxy.metal`) that:
+1.  Generates the noise in registers.
+2.  Computes neighbor correlation on the fly.
+3.  Performs a 2x2 block reduction (pooling) iteratively to approximate spectral energy at different spatial frequencies.
+4.  Estimates the final score using learned linear weights.
 
-### 4. Benchmarking
-Measure your hardware's throughput.
-
-```bash
-# Benchmark Metal performance across various batch sizes
-gobx bench-metal --seconds 5 --warmup 2
-```
-
-### 5. Self-Test
-Verify that the CPU scorer matches the canonical "golden" implementation.
-
-```bash
-gobx selftest
-```
-
-## Architecture
-
-*   **Mulberry32:** The deterministic PRNG used to generate the noise field.
-*   **Scoring Metrics:**
-    *   **Alpha:** Slope of the log-log power spectrum (expected ~3.0).
-    *   **Peakiness:** Ratio of max power to median power in the mid-frequency ring.
-    *   **Flatness:** Spectral flatness measure.
-    *   **Neighbor Correlation:** Pixel-wise correlation to ensure spatial coherence.
-*   **Seed Space:** Iterates through a 64-bit seed space using a coprime stride pattern to maximize coverage.
+Candidates passing the GPU threshold are sent to the CPU for exact scoring.
 
 ## Troubleshooting
 
-*   **Crashes:** If `gobx` crashes, a custom crash reporter will print a backtrace. Set `GOBX_NO_CRASH_REPORTER=1` to disable this.
-*   **Calibration Warnings:** If you see "No valid Metal calibration found", run the calibration commands listed above.
-*   **State Reset:** If you want to restart exploration from a random location, pass `--state-reset` to the explore command.
+*   **"No valid Metal calibration found"**: Run `gobx calibrate-metal`.
+*   **Jetsam / Out of Memory**: Use `--mem-guard-frac 0.8` to limit memory usage to 80% of physical RAM.
+*   **Crashes**: The tool includes a crash reporter that prints backtraces on SIGSEGV/SIGBUS. Set `GOBX_NO_CRASH_REPORTER=1` to disable it.
