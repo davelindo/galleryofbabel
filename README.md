@@ -77,7 +77,6 @@ If you want to configure manually (instead of using the setup wizard), create a 
 
 ```json
 {
-  "baseUrl": "https://www.echohive.ai",
   "profile": {
     "id": "YOUR_UUID_HERE",
     "name": "YourDisplayname",

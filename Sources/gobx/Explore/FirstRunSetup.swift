@@ -39,7 +39,6 @@ enum FirstRunSetup {
             Terminal.writeStdout("Interactive setup for \(configPath)\n")
         }
 
-        let baseUrl = "https://www.echohive.ai"
         let wantsProfile = promptYesNo("Configure submission profile now?", defaultValue: true)
 
         var profile: AppConfig.Profile? = nil
@@ -61,7 +60,7 @@ enum FirstRunSetup {
             enabled: wantsStats,
             url: wantsStats ? StatsCollector.defaultURL : nil
         )
-        let config = AppConfig(baseUrl: baseUrl, profile: profile, stats: statsConfig)
+        let config = AppConfig(profile: profile, stats: statsConfig)
         guard confirmWrite(to: configURL, emit: emit) else { return nil }
         do {
             try saveConfig(config, to: configURL)

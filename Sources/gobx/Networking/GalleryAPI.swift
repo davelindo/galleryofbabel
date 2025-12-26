@@ -5,7 +5,6 @@ import FoundationNetworking
 #endif
 
 struct AppConfig: Codable {
-    let baseUrl: String?
     let profile: Profile?
     let stats: StatsConfig?
 
@@ -97,7 +96,7 @@ extension SubmissionResponse {
 
 func submitScore(seed: UInt64, score: Double, config: AppConfig) async -> SubmissionResponse? {
     guard let profile = config.profile else { return nil }
-    let urlStr = (config.baseUrl ?? "https://www.echohive.ai") + "/gallery-of-babel/api/submit"
+    let urlStr = "https://www.echohive.ai/gallery-of-babel/api/submit"
     guard let url = URL(string: urlStr) else { return nil }
 
     var body: [String: Any] = [
@@ -154,9 +153,8 @@ struct TopResponse: Decodable {
 }
 
 func fetchTop(limit: Int, config: AppConfig, uniqueUsers: Bool = false) async -> TopResponse? {
-    let base = config.baseUrl ?? "https://www.echohive.ai"
     let unique = uniqueUsers ? "1" : "0"
-    let urlStr = base + "/gallery-of-babel/api/top?limit=\(limit)&unique_users=\(unique)"
+    let urlStr = "https://www.echohive.ai/gallery-of-babel/api/top?limit=\(limit)&unique_users=\(unique)"
     guard let url = URL(string: urlStr) else { return nil }
     guard let res = await runHTTP(url: url, method: "GET", jsonBody: nil, timeoutSec: 15) else { return nil }
     guard res.statusCode == 200 else { return nil }

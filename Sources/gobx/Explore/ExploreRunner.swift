@@ -504,13 +504,13 @@ enum ExploreRunner {
                     if cfg.profile == nil {
                         let handle = defaultProfile.xProfile.map { "@\($0)" } ?? "(none)"
                         emit(.warning, "No profile configured at \(GobxPaths.configURL.path); using default author profile id=\(defaultProfile.id) name=\(defaultProfile.name) x=\(handle)")
-                        return AppConfig(baseUrl: cfg.baseUrl, profile: defaultProfile, stats: cfg.stats)
+                        return AppConfig(profile: defaultProfile, stats: cfg.stats)
                     }
                     return cfg
                 }
                 let handle = defaultProfile.xProfile.map { "@\($0)" } ?? "(none)"
                 emit(.warning, "No config found at \(GobxPaths.configURL.path); using default author profile id=\(defaultProfile.id) name=\(defaultProfile.name) x=\(handle)")
-                return AppConfig(baseUrl: nil, profile: defaultProfile, stats: nil)
+                return AppConfig(profile: defaultProfile, stats: nil)
             }()
 
             let state = SubmissionState()
