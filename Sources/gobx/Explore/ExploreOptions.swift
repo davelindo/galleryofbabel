@@ -22,6 +22,7 @@ struct ExploreOptions {
     var refreshEverySec: Double = 180.0
     var reportEverySec: Double = 1.0
     var uiEnabled: Bool? = nil
+    var setupConfig: Bool = false
     var memGuardMaxGB: Double = 0.0
     var memGuardMaxFrac: Double = 0.0
     var memGuardMaxGBSpecified: Bool = false
@@ -101,6 +102,8 @@ extension ExploreOptions {
                 o.uiEnabled = true
             case "--no-ui":
                 o.uiEnabled = false
+            case "--setup":
+                o.setupConfig = true
             case "--mem-guard-gb":
                 o.memGuardMaxGB = max(0.0, try parser.requireDouble(for: "--mem-guard-gb"))
                 o.memGuardMaxGBSpecified = true

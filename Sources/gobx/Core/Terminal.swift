@@ -15,6 +15,10 @@ enum Terminal {
         return term != "dumb" && !term.isEmpty
     }
 
+    static func isInteractiveStdin() -> Bool {
+        isatty(fileno(stdin)) != 0
+    }
+
     static func stdoutSize() -> TerminalSize {
         var w = winsize()
         if ioctl(fileno(stdout), TIOCGWINSZ, &w) == 0 {

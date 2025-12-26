@@ -4,6 +4,7 @@ let gobxHelpText = """
 gobx - native high-performance scorer for Gallery of Babel (macOS/Accelerate)
 
 Usage:
+  gobx --setup
   gobx score <seed> [--backend cpu|mps] [--batch <n>] [--gpu-backend mps|metal] [--json]
   gobx selftest [--golden <path>] [--write-golden] [--count <n>] [--limit <n>] [--tolerance <x>]
   gobx bench-mps [--seconds <s>] [--warmup <s>] [--warmup-batches <n>] [--reps <n>] [--batches <csv>] [--size <n>] [--gpu-util] [--gpu-interval-ms <n>] [--inflight <n>] [--opt 0|1] [--log-dir <path>] [--json]
@@ -15,7 +16,7 @@ Usage:
   gobx explore [--count <n>] [--endless] [--start <seed>] [--threads <n>]
               [--batch <n>] [--backend cpu|mps|all] [--gpu-backend mps|metal] [--top <n>]
               [--submit] [--top-unique-users] [--min-score <x>] [--refresh-every <sec>]
-              [--report-every <sec>] [--ui|--no-ui]
+              [--report-every <sec>] [--ui|--no-ui] [--setup]
               [--mem-guard-gb <n>] [--mem-guard-frac <f>] [--mem-guard-every <sec>]
               [--mps-margin <x>] [--mps-margin-auto] [--mps-inflight <n>] [--mps-inflight-auto]
               [--mps-inflight-min <n>] [--mps-inflight-max <n>] [--mps-workers <n>] [--mps-reinit-every <sec>]
@@ -39,5 +40,8 @@ Notes:
   - `--mem-guard-gb` / `--mem-guard-frac` cap process memory (phys_footprint) and stop before Jetsam; default 0.8x phys mem on MPS; set to 0 to disable.
   - Config/profile is read from `~/.config/gallery-of-babel/config.json`.
   - If no profile is configured, `explore` falls back to the default author profile for submissions.
+  - When no config is found, `explore` offers an interactive first-run setup and optional calibration.
+  - Use `--setup` to launch the interactive setup even if a config already exists.
+  - Use `gobx --setup` to run setup without starting an explore session.
   - Set `GOBX_NO_CRASH_REPORTER=1` to disable fatal-signal backtraces.
 """

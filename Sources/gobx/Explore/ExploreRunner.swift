@@ -24,6 +24,7 @@ enum ExploreRunner {
         let mpsMarginSpecified = options.mpsMarginSpecified
         var mpsMarginAuto = options.mpsMarginAuto
         let mpsMarginAutoSpecified = options.mpsMarginAutoSpecified
+        let setupConfig = options.setupConfig
         let mpsInflight = options.mpsInflight
         let mpsWorkers = options.mpsWorkers
         var mpsInflightAuto = options.mpsInflightAuto
@@ -382,13 +383,61 @@ enum ExploreRunner {
         sigtermSource.resume()
         signalSources.append(sigtermSource)
 
+        let effectiveDoSubmit = doSubmit
         let startNs = DispatchTime.now().uptimeNanoseconds
 
-        let config = loadConfig()
+        let configPath = GobxPaths.configURL.path
+        let configExists = FileManager.default.fileExists(atPath: configPath)
+        var config = loadConfig()
+        let configIssue: FirstRunSetup.ConfigIssue? = {
+            guard config == nil else { return nil }
+            return configExists ? .unreadable : .missing
+        }()
+
+        if setupConfig {
+            if Terminal.isInteractiveStdout() && Terminal.isInteractiveStdin() {
+                if let configured = FirstRunSetup.run(
+                    trigger: .explicit,
+                    backend: resolvedBackendFinal,
+                    gpuBackend: gpuBackend,
+                    doSubmit: effectiveDoSubmit,
+                    mpsMarginSpecified: mpsMarginSpecified,
+                    emit: emit
+                ) {
+                    config = configured
+                }
+            } else {
+                emit(.warning, "--setup requires an interactive terminal; skipping.")
+            }
+        }
+
+        if config == nil, let issue = configIssue, !setupConfig {
+            if Terminal.isInteractiveStdout() && Terminal.isInteractiveStdin() {
+                if let configured = FirstRunSetup.run(
+                    trigger: .auto(issue),
+                    backend: resolvedBackendFinal,
+                    gpuBackend: gpuBackend,
+                    doSubmit: effectiveDoSubmit,
+                    mpsMarginSpecified: mpsMarginSpecified,
+                    emit: emit
+                ) {
+                    config = configured
+                }
+            } else {
+                let note: String
+                switch issue {
+                case .missing:
+                    note = "No config found at \(configPath)."
+                case .unreadable:
+                    note = "Config found at \(configPath) but could not be parsed."
+                }
+                emit(.warning, "\(note) Create \(configPath) to configure submissions.")
+            }
+        }
+
         var submission: SubmissionManager? = nil
         var refreshTimer: DispatchSourceTimer? = nil
 
-        let effectiveDoSubmit = doSubmit
         if effectiveDoSubmit {
             let defaultProfile = AppConfig.Profile.defaultAuthor
             let configForSubmit: AppConfig = {

@@ -26,6 +26,14 @@ func loadConfig() -> AppConfig? {
     return try? JSONDecoder().decode(AppConfig.self, from: data)
 }
 
+func saveConfig(_ config: AppConfig, to url: URL = GobxPaths.configURL) throws {
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try enc.encode(config)
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try data.write(to: url, options: .atomic)
+}
+
 private struct HTTPResponse {
     let statusCode: Int
     let body: Data

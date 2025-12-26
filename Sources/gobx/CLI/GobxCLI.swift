@@ -11,6 +11,11 @@ enum GobxCLI {
                 return
             }
 
+            if (args.first?.hasPrefix("-") ?? false), args.contains("--setup") {
+                try SetupCommand.run(args: args)
+                return
+            }
+
             let cmd = args[0]
             let rest = Array(args.dropFirst())
 

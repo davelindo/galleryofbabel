@@ -73,6 +73,9 @@ To submit findings to the backend, create a configuration file at `~/.config/gal
 
 If no profile is configured, `gobx explore` will fall back to the default author profile for submissions.
 
+On first run, `gobx explore` will offer an interactive setup to create this file and optionally run GPU calibration if no config exists.
+You can re-run the setup later with `gobx --setup` or `gobx explore --setup`.
+
 ## Usage
 
 ### 1. Exploration (Mining)
