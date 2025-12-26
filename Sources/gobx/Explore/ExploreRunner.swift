@@ -776,7 +776,7 @@ enum ExploreRunner {
 
                 let metrics = buildStatsMetrics(snap: snap, lastSnap: state.lastSnap, dt: dt, now: now)
                 if let payload = StatsCollector.makePayload(metrics: metrics, runId: statsRunId) {
-                    Task { _ = await StatsCollector.send(payload: payload, url: statsUrl) }
+                    StatsCollector.enqueue(payload: payload, url: statsUrl)
                 }
 
                 state.lastSnap = snap
@@ -1004,10 +1004,7 @@ enum ExploreRunner {
                 gpuAvg: mpsAvg
             )
             if let payload = StatsCollector.makePayload(metrics: metrics, runId: statsRunId) {
-                let ok = await StatsCollector.send(payload: payload, url: statsUrl)
-                if !ok {
-                    emit(.warning, "Anonymous stats upload failed (url=\(statsUrl))")
-                }
+                StatsCollector.enqueue(payload: payload, url: statsUrl)
             }
         }
     }

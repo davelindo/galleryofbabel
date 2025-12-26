@@ -4,6 +4,7 @@ import Metal
 enum StatsCollector {
     static let schemaVersion = 1
     static let defaultURL = "https://gobx-stats.davelindon.me/ingest"
+    private static let uploader = StatsUploadQueue()
 
     struct Payload: Codable {
         let schemaVersion: Int
@@ -108,6 +109,70 @@ enum StatsCollector {
             return (200..<300).contains(http.statusCode)
         } catch {
             return false
+        }
+    }
+
+    static func enqueue(payload: Payload, url: String) {
+        Task.detached(priority: .utility) {
+            await uploader.enqueue(payload: payload, url: url)
+        }
+    }
+
+    private actor StatsUploadQueue {
+        struct Item {
+            let payload: Payload
+            let url: String
+            var attempts: Int
+        }
+
+        private var queue: [Item] = []
+        private var isSending = false
+        private let maxQueueDepth = 4
+        private let maxAttempts = 3
+        private let retryDelaysNs: [UInt64] = [
+            2_000_000_000,
+            5_000_000_000,
+            10_000_000_000,
+        ]
+
+        func enqueue(payload: Payload, url: String) async {
+            if queue.count >= maxQueueDepth {
+                queue.removeFirst(queue.count - maxQueueDepth + 1)
+            }
+            queue.append(Item(payload: payload, url: url, attempts: 0))
+
+            guard !isSending else { return }
+            isSending = true
+            Task.detached(priority: .utility) { [weak self] in
+                guard let self else { return }
+                await self.processQueue()
+            }
+        }
+
+        private func processQueue() async {
+            while true {
+                guard var item = queue.first else {
+                    isSending = false
+                    return
+                }
+                queue.removeFirst()
+
+                var sent = false
+                while item.attempts < maxAttempts {
+                    item.attempts += 1
+                    let ok = await StatsCollector.send(payload: item.payload, url: item.url, timeoutSec: 2.5)
+                    if ok {
+                        sent = true
+                        break
+                    }
+                    let delayIdx = min(item.attempts - 1, retryDelaysNs.count - 1)
+                    try? await Task.sleep(nanoseconds: retryDelaysNs[delayIdx])
+                }
+
+                if !sent {
+                    // drop on repeated failure
+                }
+            }
         }
     }
 
