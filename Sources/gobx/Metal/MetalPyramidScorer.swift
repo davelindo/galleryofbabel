@@ -15,6 +15,7 @@ enum MetalPyramidScorerError: Error, CustomStringConvertible {
     case pipelineInitFailed
     case threadgroupSizeUnsupported(Int)
     case bufferAllocationFailed(name: String, length: Int)
+    case commandTimeout
 
     var description: String {
         switch self {
@@ -42,6 +43,8 @@ enum MetalPyramidScorerError: Error, CustomStringConvertible {
             return "Unsupported threadgroup size: \(n)"
         case .bufferAllocationFailed(let name, let length):
             return "Failed to allocate Metal buffer '\(name)' (\(length) bytes)"
+        case .commandTimeout:
+            return "Timed out waiting for Metal command buffer completion"
         }
     }
 }
@@ -181,7 +184,7 @@ final class MetalPyramidScorer: GPUScorer {
         self.metalDevice = device
         self.commandQueue = queue
         let descriptor = MTLCommandBufferDescriptor()
-        descriptor.retainedReferences = false
+        descriptor.retainedReferences = true
         self.commandBufferDescriptor = descriptor
 
         guard let url = Bundle.module.url(forResource: "PyramidProxy", withExtension: "metal") else {
@@ -259,9 +262,9 @@ final class MetalPyramidScorer: GPUScorer {
         let inLen = batchSize * MemoryLayout<UInt64>.stride
         let outLen = batchSize * MemoryLayout<Float>.stride
         let paramsLen = MemoryLayout<ProxyParams>.stride
-        let inputOptions: MTLResourceOptions = [.storageModeShared, .cpuCacheModeWriteCombined]
+        let inputOptions: MTLResourceOptions = [.storageModeShared]
         let outputOptions: MTLResourceOptions = [.storageModeShared]
-        let paramsOptions: MTLResourceOptions = [.storageModeShared, .cpuCacheModeWriteCombined]
+        let paramsOptions: MTLResourceOptions = [.storageModeShared]
 
         var slots: [Slot] = []
         slots.reserveCapacity(inflight)
@@ -384,7 +387,10 @@ final class MetalPyramidScorer: GPUScorer {
         flushPendingBatch()
         let slot = slots[job.slotIndex]
 
-        slot.done.wait()
+        let waitResult = slot.done.wait(timeout: .now() + .seconds(30))
+        if waitResult == .timedOut {
+            throw MetalPyramidScorerError.commandTimeout
+        }
         if let e = slot.takeError() {
             throw e
         }

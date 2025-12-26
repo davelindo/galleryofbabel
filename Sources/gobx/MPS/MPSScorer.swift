@@ -14,6 +14,7 @@ enum MPSScorerError: Error, CustomStringConvertible {
     case outputProbeFailed
     case unexpectedOutputType(MPSDataType)
     case unexpectedOutputShape([NSNumber])
+    case commandTimeout
 
     var description: String {
         switch self {
@@ -35,6 +36,8 @@ enum MPSScorerError: Error, CustomStringConvertible {
             return "Unexpected MPSGraph output type: \(t)"
         case .unexpectedOutputShape(let s):
             return "Unexpected MPSGraph output shape: \(s)"
+        case .commandTimeout:
+            return "Timed out waiting for MPSGraph execution"
         }
     }
 }
@@ -174,7 +177,7 @@ final class MPSScorer: GPUScorer {
 
         let inLen = batchSize * MemoryLayout<UInt64>.stride
         let outLen = batchSize * MemoryLayout<Float>.stride
-        let inputOptions: MTLResourceOptions = [.storageModeShared, .cpuCacheModeWriteCombined]
+        let inputOptions: MTLResourceOptions = [.storageModeShared]
         let outputOptions: MTLResourceOptions = [.storageModeShared]
 
         var slots: [Slot] = []
@@ -271,7 +274,10 @@ final class MPSScorer: GPUScorer {
         precondition(job.count >= 0 && job.count <= batchSize)
         let slot = slots[job.slotIndex]
 
-        slot.done.wait()
+        let waitResult = slot.done.wait(timeout: .now() + .seconds(30))
+        if waitResult == .timedOut {
+            throw MPSScorerError.commandTimeout
+        }
         if let e = slot.takeError() {
             throw e
         }
