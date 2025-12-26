@@ -33,6 +33,10 @@ enum GobxPaths {
         configDir.appendingPathComponent("gobx-submission-queue.json")
     }
 
+    static var updateStateURL: URL {
+        configDir.appendingPathComponent("gobx-update-state.json")
+    }
+
     static var gpuTuningURL: URL {
         configDir.appendingPathComponent("gobx-gpu-tuning.json")
     }

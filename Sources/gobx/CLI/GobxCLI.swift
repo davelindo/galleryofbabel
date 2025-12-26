@@ -19,6 +19,8 @@ enum GobxCLI {
             let cmd = args[0]
             let rest = Array(args.dropFirst())
 
+            UpdateChecker.scheduleIfNeeded(command: cmd)
+
             switch cmd {
             case "score":
                 try ScoreCommand.run(args: rest)
