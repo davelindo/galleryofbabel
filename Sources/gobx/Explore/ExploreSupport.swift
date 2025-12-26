@@ -463,6 +463,7 @@ final class SubmissionManager: @unchecked Sendable {
     private let userMinScore: Double
     private let topUniqueUsers: Bool
     private let printLock: NSLock
+    private let logTimestamps: Bool
     private let events: ExploreEventLog?
     private let queue = DispatchQueue(label: "gobx.submit", qos: .utility)
     private let queueKey = DispatchSpecificKey<UInt8>()
@@ -502,6 +503,7 @@ final class SubmissionManager: @unchecked Sendable {
         userMinScore: Double,
         topUniqueUsers: Bool,
         printLock: NSLock,
+        logTimestamps: Bool,
         events: ExploreEventLog?
     ) {
         self.config = config
@@ -509,6 +511,7 @@ final class SubmissionManager: @unchecked Sendable {
         self.userMinScore = userMinScore
         self.topUniqueUsers = topUniqueUsers
         self.printLock = printLock
+        self.logTimestamps = logTimestamps
         self.events = events
         queue.setSpecific(key: queueKey, value: 1)
         submitQueue.reserveCapacity(64)
@@ -519,7 +522,7 @@ final class SubmissionManager: @unchecked Sendable {
         if let events {
             events.append(kind, message)
         } else {
-            printLock.withLock { print(message) }
+            printLock.withLock { print(formatLogLine(message, includeTimestamp: logTimestamps)) }
         }
     }
 
@@ -1182,6 +1185,7 @@ final class CandidateVerifier: @unchecked Sendable {
     private let best: BestTracker
     private let submission: SubmissionManager?
     private let printLock: NSLock
+    private let logTimestamps: Bool
     private let events: ExploreEventLog?
     private let stats: ExploreStats
     private let margin: AdaptiveMargin?
@@ -1201,6 +1205,7 @@ final class CandidateVerifier: @unchecked Sendable {
         best: BestTracker,
         submission: SubmissionManager?,
         printLock: NSLock,
+        logTimestamps: Bool,
         events: ExploreEventLog?,
         stats: ExploreStats,
         margin: AdaptiveMargin? = nil,
@@ -1211,6 +1216,7 @@ final class CandidateVerifier: @unchecked Sendable {
         self.best = best
         self.submission = submission
         self.printLock = printLock
+        self.logTimestamps = logTimestamps
         self.events = events
         self.stats = stats
         self.margin = margin
@@ -1281,7 +1287,7 @@ final class CandidateVerifier: @unchecked Sendable {
             if let events = events {
                 events.append(.best, msg)
             } else {
-                printLock.withLock { print(msg) }
+                printLock.withLock { print(formatLogLine(msg, includeTimestamp: logTimestamps)) }
             }
         }
 
@@ -1293,7 +1299,7 @@ final class CandidateVerifier: @unchecked Sendable {
                     if let events {
                         events.append(.info, msg)
                     } else {
-                        printLock.withLock { print(msg) }
+                        printLock.withLock { print(formatLogLine(msg, includeTimestamp: logTimestamps)) }
                     }
                 }
             }
@@ -1306,7 +1312,7 @@ final class CandidateVerifier: @unchecked Sendable {
                     if let events {
                         events.append(.info, msg)
                     } else {
-                        printLock.withLock { print(msg) }
+                        printLock.withLock { print(formatLogLine(msg, includeTimestamp: logTimestamps)) }
                     }
                 }
             }

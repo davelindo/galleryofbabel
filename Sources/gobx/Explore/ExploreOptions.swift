@@ -7,6 +7,7 @@ struct ExploreOptions {
     var startSeed: UInt64? = nil
     var threads: Int? = nil
     var batch: Int = 64
+    var batchSpecified: Bool = false
     var backend: Backend = .cpu
     var backendSpecified: Bool = false
     var gpuBackend: GPUBackend = .metal
@@ -40,6 +41,7 @@ struct ExploreOptions {
     var mpsMarginAuto: Bool = false
     var mpsMarginAutoSpecified: Bool = false
     var mpsInflight: Int = 2
+    var mpsInflightSpecified: Bool = false
     var mpsWorkers: Int = 0
     var mpsInflightAuto: Bool = false
     var mpsInflightMin: Int = 0
@@ -77,6 +79,7 @@ extension ExploreOptions {
                 o.threads = try parser.requireInt(for: "--threads")
             case "--batch":
                 o.batch = try parser.requireInt(for: "--batch")
+                o.batchSpecified = true
             case "--backend":
                 o.backend = try parser.requireEnum(for: "--backend", Backend.self)
                 o.backendSpecified = true
@@ -132,6 +135,7 @@ extension ExploreOptions {
                 o.mpsMarginAutoSpecified = true
             case "--mps-inflight":
                 o.mpsInflight = max(1, try parser.requireInt(for: "--mps-inflight"))
+                o.mpsInflightSpecified = true
             case "--mps-inflight-auto":
                 o.mpsInflightAuto = true
             case "--mps-inflight-min":

@@ -147,9 +147,24 @@ private final class LocalResultsBox: @unchecked Sendable {
     }
 }
 
+private enum ExploreMPSStallError: Error, LocalizedError {
+    case noProgress(seconds: Double)
+    case noSeeds
+
+    var errorDescription: String? {
+        switch self {
+        case .noProgress(let seconds):
+            return String(format: "no GPU progress for %.1fs", seconds)
+        case .noSeeds:
+            return "seed allocator returned no seeds for endless explore"
+        }
+    }
+}
+
 final class ExploreMPSManager: @unchecked Sendable {
     struct Params {
         let resolvedBackend: Backend
+        let gpuBackend: GPUBackend
         let endless: Bool
         let total: Int
         let cpuThreadCount: Int
@@ -179,6 +194,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         let verifier: CandidateVerifier?
 
         let printLock: NSLock
+        let logTimestamps: Bool
         let events: ExploreEventLog?
         let stats: ExploreStats
         let bestApprox: ApproxBestTracker
@@ -213,7 +229,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         if let events = p.events {
             events.append(kind, message)
         } else {
-            p.printLock.withLock { print(message) }
+            p.printLock.withLock { print(formatLogLine(message, includeTimestamp: p.logTimestamps)) }
         }
     }
 
@@ -322,6 +338,8 @@ final class ExploreMPSManager: @unchecked Sendable {
         var sampleM2 = 0.0
         let sampleLock = NSLock()
         let topApproxLimit = max(0, p.topApproxLimit)
+        let stallTimeoutNs: UInt64 = 30_000_000_000
+        var lastProgressNs = DispatchTime.now().uptimeNanoseconds
 
         func currentSampleGate(baseThr: Double, margin: Double) -> Double? {
             guard autoMarginEnabled, sampleCount >= sampleMinCount else { return nil }
@@ -585,6 +603,11 @@ final class ExploreMPSManager: @unchecked Sendable {
         var inflightWarmupRemaining = inflightAuto ? inflightWarmupIntervals : 0
         var recoveryAttempts = 0
         let maxRecoveryAttempts = 3
+        var noSeedsAvailable = false
+        var lastSavedBatch = 0
+        var lastSavedInflight = 0
+        var lastSavedNs: UInt64 = 0
+        let saveCooldownNs: UInt64 = 30_000_000_000
 
         func currentStep() -> (up: Double, down: Double) {
             tuneStepLevels[tuneLevel]
@@ -658,6 +681,9 @@ final class ExploreMPSManager: @unchecked Sendable {
             if let metalError = error as? MetalPyramidScorerError, case .commandTimeout = metalError {
                 return true
             }
+            if error is ExploreMPSStallError {
+                return true
+            }
             return false
         }
 
@@ -714,6 +740,23 @@ final class ExploreMPSManager: @unchecked Sendable {
             lastTuneCompleted = completed
             inflightLastTuneNs = now
             inflightLastCompleted = completed
+        }
+
+        func maybeSaveTune(now: UInt64) {
+            guard autoEnabled || inflightAuto else { return }
+            guard (!autoEnabled || tuneSettled), (!inflightAuto || inflightTuneSettled) else { return }
+            guard pendingTune == nil else { return }
+
+            let batchToSave = autoEnabled ? bestTuneBatch : batch
+            let inflightToSave = inflightAuto ? inflightBest : inflight
+            guard batchToSave > 0, inflightToSave > 0 else { return }
+            if batchToSave == lastSavedBatch, inflightToSave == lastSavedInflight { return }
+            if now &- lastSavedNs < saveCooldownNs { return }
+
+            GPUTuning.save(batch: batchToSave, inflight: inflightToSave, gpuBackend: p.gpuBackend)
+            lastSavedBatch = batchToSave
+            lastSavedInflight = inflightToSave
+            lastSavedNs = now
         }
 
         if useState {
@@ -888,7 +931,10 @@ final class ExploreMPSManager: @unchecked Sendable {
             }
 
             for i in 0..<n {
-                guard let s = nextSeed() else { return false }
+                guard let s = nextSeed() else {
+                    noSeedsAvailable = true
+                    return false
+                }
                 seeds[i] = s
             }
             if n < seeds.count {
@@ -911,6 +957,7 @@ final class ExploreMPSManager: @unchecked Sendable {
                     processBatch(seedsBuf: seedsBuf, scoresBuf: scoresBuf, count: job.count)
                 }
                 completed += job.count
+                lastProgressNs = DispatchTime.now().uptimeNanoseconds
                 recoveryAttempts = 0
             } catch {
                 let recovered = recoverFromError(error)
@@ -924,19 +971,44 @@ final class ExploreMPSManager: @unchecked Sendable {
 
         while true {
             let now = DispatchTime.now().uptimeNanoseconds
+            noSeedsAvailable = false
             applyPendingTune(now: now)
             maybeReinit()
             maybeTune(now: now)
             maybeTuneInflight(now: now)
+            maybeSaveTune(now: now)
 
             if pendingTune == nil {
                 while pending.count < inflight {
                     if !enqueueNext() { break }
                 }
             }
-            if !drainOne() { break }
+            if drainOne() { continue }
             if p.stop.isStopRequested(), pending.isEmpty { break }
             if let q = quota, completed >= q, pending.isEmpty { break }
+            if noSeedsAvailable, pending.isEmpty {
+                if !p.endless { break }
+                let recovered = recoverFromError(ExploreMPSStallError.noSeeds)
+                lastProgressNs = now
+                if !recovered {
+                    emit(.warning, "Warning: GPU stalled (seed allocator empty); stopping")
+                    p.stop.requestStop()
+                    break
+                }
+                continue
+            }
+            let stalledForNs = now &- lastProgressNs
+            if pending.isEmpty, stalledForNs >= stallTimeoutNs {
+                let recovered = recoverFromError(ExploreMPSStallError.noProgress(seconds: Double(stalledForNs) / 1e9))
+                lastProgressNs = now
+                if !recovered {
+                    emit(.warning, String(format: "Warning: GPU stalled for %.1fs; stopping", Double(stalledForNs) / 1e9))
+                    p.stop.requestStop()
+                    break
+                }
+                continue
+            }
+            Thread.sleep(forTimeInterval: 0.01)
         }
 
         while drainOne() {}

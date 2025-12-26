@@ -33,6 +33,10 @@ enum GobxPaths {
         configDir.appendingPathComponent("gobx-submission-queue.json")
     }
 
+    static var gpuTuningURL: URL {
+        configDir.appendingPathComponent("gobx-gpu-tuning.json")
+    }
+
     static func expandPath(_ path: String) -> String {
         (path as NSString).expandingTildeInPath
     }

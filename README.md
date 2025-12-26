@@ -21,7 +21,7 @@ It features a dual-backend architecture:
 
 | Date | Hardware | Device ID | Backend | Throughput | Power | Efficiency |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 2025-12-26 | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | MPS (GPU) | **4.78M seeds/s** | ~46W | **374.1M seeds/Wh** |
+| 2025-12-26 | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **4,779,931 seeds/s** | ~46W | **374.1M seeds/Wh** |
 | n/a | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **2.04M seeds/s** | ~40W | **183.4M seeds/Wh** |
 
 *Efficiency calculated as (Seeds per Second * 3600) / Watts.*

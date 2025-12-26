@@ -7,7 +7,8 @@ enum ExploreRunner {
         var endlessFlag = options.endlessFlag
         let startSeed = options.startSeed
         let threads = options.threads
-        let batch = options.batch
+        var batch = options.batch
+        let batchSpecified = options.batchSpecified
         var backend = options.backend
         let backendSpecified = options.backendSpecified
         var gpuBackend = options.gpuBackend
@@ -25,20 +26,21 @@ enum ExploreRunner {
         var mpsMarginAuto = options.mpsMarginAuto
         let mpsMarginAutoSpecified = options.mpsMarginAutoSpecified
         let setupConfig = options.setupConfig
-        let mpsInflight = options.mpsInflight
+        var mpsInflight = options.mpsInflight
+        let mpsInflightSpecified = options.mpsInflightSpecified
         let mpsWorkers = options.mpsWorkers
         var mpsInflightAuto = options.mpsInflightAuto
         var mpsInflightMin = options.mpsInflightMin
         var mpsInflightMax = options.mpsInflightMax
-        let mpsInflightMinSpecified = options.mpsInflightMinSpecified
-        let mpsInflightMaxSpecified = options.mpsInflightMaxSpecified
+        var mpsInflightMinSpecified = options.mpsInflightMinSpecified
+        var mpsInflightMaxSpecified = options.mpsInflightMaxSpecified
         let mpsReinitEverySec = options.mpsReinitEverySec
         var mpsBatchAuto = options.mpsBatchAuto
         let mpsBatchAutoSpecified = options.mpsBatchAutoSpecified
         var mpsBatchMin = options.mpsBatchMin
         var mpsBatchMax = options.mpsBatchMax
-        let mpsBatchMinSpecified = options.mpsBatchMinSpecified
-        let mpsBatchMaxSpecified = options.mpsBatchMaxSpecified
+        var mpsBatchMinSpecified = options.mpsBatchMinSpecified
+        var mpsBatchMaxSpecified = options.mpsBatchMaxSpecified
         let mpsBatchTuneEverySec = options.mpsBatchTuneEverySec
         let refreshEverySec = options.refreshEverySec
         let reportEverySec = options.reportEverySec
@@ -69,6 +71,10 @@ enum ExploreRunner {
             if let v = uiEnabledArg { return v }
             return Terminal.isInteractiveStdout()
         }()
+        let logTimestamps = !uiEnabledFinal
+        if !uiEnabledFinal {
+            configureNoUILogging()
+        }
 
         let uiRefreshEverySec: Double = {
             guard uiEnabledFinal else { return reportEverySec }
@@ -82,8 +88,12 @@ enum ExploreRunner {
             if let eventLog {
                 eventLog.append(kind, message)
             } else {
-                printLock.withLock { print(message) }
+                printLock.withLock { print(formatLogLine(message, includeTimestamp: logTimestamps)) }
             }
+        }
+
+        func logPrint(_ message: String) {
+            printLock.withLock { print(formatLogLine(message, includeTimestamp: logTimestamps)) }
         }
 
         func waitForDispatchGroup(_ group: DispatchGroup) async {
@@ -123,13 +133,47 @@ enum ExploreRunner {
             mpsInflightAuto = true
         }
 
+        if metalAvailable, (backend == .mps || backend == .all), (mpsBatchAuto || mpsInflightAuto) {
+            if let hint = GPUTuning.hint(gpuBackend: gpuBackend) {
+                if !batchSpecified {
+                    batch = hint.batch
+                }
+                if !mpsInflightSpecified {
+                    mpsInflight = hint.inflight
+                }
+                if mpsBatchAuto {
+                    if !mpsBatchMinSpecified {
+                        mpsBatchMin = hint.batchMin
+                        mpsBatchMinSpecified = true
+                    }
+                    if !mpsBatchMaxSpecified {
+                        mpsBatchMax = hint.batchMax
+                        mpsBatchMaxSpecified = true
+                    }
+                }
+                if mpsInflightAuto {
+                    if !mpsInflightMinSpecified {
+                        mpsInflightMin = hint.inflightMin
+                        mpsInflightMinSpecified = true
+                    }
+                    if !mpsInflightMaxSpecified {
+                        mpsInflightMax = hint.inflightMax
+                        mpsInflightMaxSpecified = true
+                    }
+                }
+                let batchRange = mpsBatchAuto ? "\(mpsBatchMin)-\(mpsBatchMax)" : "fixed"
+                let inflightRange = mpsInflightAuto ? "\(mpsInflightMin)-\(mpsInflightMax)" : "fixed"
+                emit(.info, "GPU autotune seed: batch=\(batch) inflight=\(mpsInflight) batch-range=\(batchRange) inflight-range=\(inflightRange) source=\(hint.source)")
+            }
+        }
+
         let mpsBatch = max(1, batch)
         if mpsBatchAuto {
             if !mpsBatchMinSpecified {
                 mpsBatchMin = max(1, mpsBatch / 2)
             }
             if !mpsBatchMaxSpecified {
-                mpsBatchMax = max(mpsBatch, 12288)
+                mpsBatchMax = max(mpsBatch, 4096)
             }
             if mpsBatchMax < mpsBatchMin {
                 throw GobxError.usage("--mps-batch-max must be >= --mps-batch-min")
@@ -480,6 +524,7 @@ enum ExploreRunner {
                 userMinScore: minScore,
                 topUniqueUsers: topUniqueUsers,
                 printLock: printLock,
+                logTimestamps: logTimestamps,
                 events: eventLog
             )
 
@@ -530,6 +575,7 @@ enum ExploreRunner {
                     best: best,
                     submission: submission,
                     printLock: printLock,
+                    logTimestamps: logTimestamps,
                     events: eventLog,
                     stats: stats,
                     margin: mpsMarginTracker,
@@ -620,27 +666,27 @@ enum ExploreRunner {
                     return String(format: " cpuv=%llu (%.0f/s avg=%.6f)", snap.cpuVerifyCount, cpuVerifyRate, cpuVerifyAvg)
                 }()
 
-                printLock.withLock {
-                    switch resolvedBackendFinal {
-                    case .all:
-                        let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)",
-                                          elapsed,
-                                          snap.cpuCount, cpuRate, cpuAvg,
-                                          snap.mpsCount, mpsRate, mpsAvg,
-                                          totalCount, totalRate, totalAvg)
-                        print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
-                    case .cpu:
-                        let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f)",
-                                          elapsed,
-                                          snap.cpuCount, cpuRate, cpuAvg)
-                        print("\(base) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
-                    case .mps:
-                        let base = String(format: "t=%.1fs mps=%llu (%.0f/s avg=%.6f)",
-                                          elapsed,
-                                          snap.mpsCount, mpsRate, mpsAvg)
-                        print("\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)")
-                    }
+                let line: String
+                switch resolvedBackendFinal {
+                case .all:
+                    let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)",
+                                      elapsed,
+                                      snap.cpuCount, cpuRate, cpuAvg,
+                                      snap.mpsCount, mpsRate, mpsAvg,
+                                      totalCount, totalRate, totalAvg)
+                    line = "\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)"
+                case .cpu:
+                    let base = String(format: "t=%.1fs cpu=%llu (%.0f/s avg=%.6f)",
+                                      elapsed,
+                                      snap.cpuCount, cpuRate, cpuAvg)
+                    line = "\(base) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)"
+                case .mps:
+                    let base = String(format: "t=%.1fs mps=%llu (%.0f/s avg=%.6f)",
+                                      elapsed,
+                                      snap.mpsCount, mpsRate, mpsAvg)
+                    line = "\(base)\(cpuVerifySuffix) best=\(bestStr)\(bestApproxSuffix)\(thrSuffix)"
                 }
+                logPrint(line)
 
                 state.lastSnap = snap
                 state.lastNs = now
@@ -693,6 +739,7 @@ enum ExploreRunner {
                     baseSeed: baseSeedForStride,
                     flushIntervalNs: cpuFlushIntervalNs,
                     printLock: printLock,
+                    logTimestamps: logTimestamps,
                     events: eventLog,
                     stats: stats,
                     best: best,
@@ -707,6 +754,7 @@ enum ExploreRunner {
 
         let makeScorerSnapshot = makeScorer
         let mpsScoreShiftSnapshot = mpsShiftTracker
+        let gpuBackendSnapshot = gpuBackend
         if resolvedBackendFinal == .mps || resolvedBackendFinal == .all {
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async {
@@ -715,6 +763,7 @@ enum ExploreRunner {
 
                 let manager = ExploreMPSManager(params: .init(
                     resolvedBackend: resolvedBackendFinal,
+                    gpuBackend: gpuBackendSnapshot,
                     endless: endless,
                     total: total,
                     cpuThreadCount: cpuThreadCount,
@@ -739,6 +788,7 @@ enum ExploreRunner {
                     submission: submissionForWorkers,
                     verifier: candidateVerifier,
                     printLock: printLock,
+                    logTimestamps: logTimestamps,
                     events: eventLog,
                     stats: stats,
                     bestApprox: bestApprox,
@@ -770,16 +820,12 @@ enum ExploreRunner {
         if !stopRequested, topN > 0, resolvedBackendFinal != .cpu {
             let top = topApproxTracker.snapshot()
             if !top.isEmpty {
-                printLock.withLock {
-                    print("Top \(top.count) (mps approx -> cpu verified):")
-                }
+                logPrint("Top \(top.count) (mps approx -> cpu verified):")
 
                 let cpu = Scorer(size: 128)
                 for (idx, e) in top.enumerated() {
                     let exact = cpu.score(seed: e.seed).totalScore
-                    printLock.withLock {
-                        print("#\(idx + 1) seed=\(e.seed) approx=\(String(format: "%.6f", Double(e.score))) exact=\(String(format: "%.6f", exact))")
-                    }
+                    logPrint("#\(idx + 1) seed=\(e.seed) approx=\(String(format: "%.6f", Double(e.score))) exact=\(String(format: "%.6f", exact))")
                 }
             }
         }
@@ -819,28 +865,28 @@ enum ExploreRunner {
             return String(format: " cpuv=%llu (%.0f/s avg=%.6f)", snap.cpuVerifyCount, cpuVerifyRate, cpuVerifyAvg)
         }()
 
-        printLock.withLock {
-            switch resolvedBackendFinal {
-            case .all:
-                print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
+        let summary: String
+        switch resolvedBackendFinal {
+        case .all:
+            summary = String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) mps=%llu (%.0f/s avg=%.6f) total=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
                              dt,
                              snap.cpuCount, cpuRate, cpuAvg,
                              snap.mpsCount, mpsRate, mpsAvg,
                              totalCount, totalRate, totalAvg,
                              cpuVerifySuffix,
-                             bestFinal.score, bestFinal.seed, bestFinal.tag))
-            case .cpu:
-                print(String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) best=%.6f (%llu)%@",
+                             bestFinal.score, bestFinal.seed, bestFinal.tag)
+        case .cpu:
+            summary = String(format: "elapsed=%.2fs cpu=%llu (%.0f/s avg=%.6f) best=%.6f (%llu)%@",
                              dt,
                              snap.cpuCount, cpuRate, cpuAvg,
-                             bestFinal.score, bestFinal.seed, bestFinal.tag))
-            case .mps:
-                print(String(format: "elapsed=%.2fs mps=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
+                             bestFinal.score, bestFinal.seed, bestFinal.tag)
+        case .mps:
+            summary = String(format: "elapsed=%.2fs mps=%llu (%.0f/s avg=%.6f)%@ best=%.6f (%llu)%@",
                              dt,
                              snap.mpsCount, mpsRate, mpsAvg,
                              cpuVerifySuffix,
-                             bestFinal.score, bestFinal.seed, bestFinal.tag))
-            }
+                             bestFinal.score, bestFinal.seed, bestFinal.tag)
         }
+        logPrint(summary)
     }
 }

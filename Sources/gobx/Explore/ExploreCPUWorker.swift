@@ -12,6 +12,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
         let baseSeed: UInt64
         let flushIntervalNs: UInt64
         let printLock: NSLock
+        let logTimestamps: Bool
         let events: ExploreEventLog?
         let stats: ExploreStats
         let best: BestTracker
@@ -82,7 +83,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
             if let events = p.events {
                 events.append(.info, startMsg)
             } else {
-                p.printLock.withLock { print(startMsg) }
+                p.printLock.withLock { print(formatLogLine(startMsg, includeTimestamp: p.logTimestamps)) }
             }
 
             var localBest = -Double.infinity
@@ -166,7 +167,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
         if let events = p.events {
             events.append(.best, msg)
         } else {
-            p.printLock.withLock { print(msg) }
+            p.printLock.withLock { print(formatLogLine(msg, includeTimestamp: p.logTimestamps)) }
         }
     }
 }
