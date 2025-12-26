@@ -38,6 +38,7 @@ This approach reached the #1 spot on the Gallery of Babel leaderboard.
 *   **OS:** macOS 14.0+ (Requires Metal and Accelerate frameworks).
 *   **Hardware:** Apple Silicon (M1/M2/M3/M4/M5) recommended for Metal performance.
 *   **Build:** Swift 6.0+.
+*   **Tooling:** Xcode Command Line Tools (or full Xcode) for Swift/SwiftPM (`xcode-select --install`).
 
 ## Installation
 
