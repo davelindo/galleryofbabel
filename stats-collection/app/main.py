@@ -7,9 +7,17 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .dashboard import (
+    build_summary,
+    parse_samples,
+    render_all_assets,
+    render_performance_by_version,
+    render_performance_over_time,
+    render_total_rate_card,
+)
 
 DB_PATH = os.environ.get("STATS_DB_PATH", "/data/stats.db")
 
@@ -182,3 +190,115 @@ def ingest(payload: RunStats) -> dict:
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+def _load_samples(limit: int = 5000) -> list:
+    conn = _connect()
+    rows = conn.execute(
+        """
+        SELECT received_at, app_version, total_rate, total_count, elapsed_sec
+        FROM runs
+        ORDER BY received_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return parse_samples(rows)
+
+
+@app.get("/stats")
+def stats_dashboard() -> Response:
+    samples = _load_samples()
+    summary = build_summary(samples)
+    last_seen = (
+        summary.last_received_at.isoformat() if summary.last_received_at else "No data"
+    )
+    body = f"""
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>Gobx Stats Dashboard</title>
+        <style>
+          body {{
+            font-family: system-ui, sans-serif;
+            margin: 32px;
+            color: #0f172a;
+            background: #f8fafc;
+          }}
+          .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+          }}
+          .card {{
+            background: white;
+            padding: 16px;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
+          }}
+          .label {{ color: #64748b; font-size: 12px; text-transform: uppercase; }}
+          .value {{ font-size: 20px; font-weight: 600; margin-top: 6px; }}
+          img {{ max-width: 100%; height: auto; border-radius: 12px; }}
+        </style>
+      </head>
+      <body>
+        <h1>Gobx Stats Dashboard</h1>
+        <div class="grid">
+          <div class="card">
+            <div class="label">Estimated total rate</div>
+            <div class="value">{summary.estimated_rate:.1f}/s</div>
+            <div class="label">Median of last {summary.sample_count} runs</div>
+          </div>
+          <div class="card">
+            <div class="label">Total runs</div>
+            <div class="value">{summary.total_runs}</div>
+          </div>
+          <div class="card">
+            <div class="label">Versions seen</div>
+            <div class="value">{summary.unique_versions}</div>
+          </div>
+          <div class="card">
+            <div class="label">Last received</div>
+            <div class="value">{last_seen}</div>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:16px;">
+          <h2>Estimated total rate</h2>
+          <img src="/stats/assets/total_rate.png" alt="Estimated total rate" />
+        </div>
+        <div class="card" style="margin-bottom:16px;">
+          <h2>Performance over time</h2>
+          <img src="/stats/assets/perf_over_time.png" alt="Performance over time" />
+        </div>
+        <div class="card">
+          <h2>Performance by app version</h2>
+          <img src="/stats/assets/perf_by_version.png" alt="Performance by version" />
+        </div>
+      </body>
+    </html>
+    """
+    return Response(content=body, media_type="text/html")
+
+
+@app.get("/stats/assets/{asset_name}")
+def stats_asset(asset_name: str) -> Response:
+    samples = _load_samples()
+    assets = {
+        "total_rate.png": render_total_rate_card(build_summary(samples)),
+        "perf_over_time.png": render_performance_over_time(samples),
+        "perf_by_version.png": render_performance_by_version(samples),
+    }
+    image = assets.get(asset_name)
+    if image is None:
+        return Response(status_code=404)
+    return Response(content=image, media_type="image/png")
+
+
+@app.get("/stats/assets")
+def stats_assets_bundle() -> Response:
+    samples = _load_samples()
+    payload = render_all_assets(samples)
+    return Response(content=json.dumps({k: len(v) for k, v in payload.items()}))
