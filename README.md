@@ -12,10 +12,11 @@ It features a dual-backend architecture:
 ## Features
 
 *   **Hybrid Mining:** Uses the Metal GPU for wide-net searching and CPU for precise verification.
-*   **Adaptive GPU Tuning:** Auto-tunes batch size and margin for throughput and accuracy.
+*   **Adaptive GPU Tuning:** Auto-tunes batch size, inflight depth, and margin for throughput and accuracy.
 *   **Automated Calibration:** Tools to tune GPU scoring thresholds against CPU ground truth for your specific hardware.
 *   **State Management:** Tracks exploration progress to prevent re-scanning the same seed ranges.
 *   **Live Submission:** Automatically submits qualifying seeds to the Gallery of Babel API.
+*   **Optional Stats:** Opt-in, anonymized performance stats collection.
 
 ## Performance
 
@@ -35,7 +36,7 @@ This approach reached the #1 spot on the Gallery of Babel leaderboard.
 ## Requirements
 
 *   **OS:** macOS 14.0+ (Requires Metal and Accelerate frameworks).
-*   **Hardware:** Apple Silicon (M1/M2/M3/M4) recommended for Metal performance.
+*   **Hardware:** Apple Silicon (M1/M2/M3/M4/M5) recommended for Metal performance.
 *   **Build:** Swift 6.0+.
 
 ## Installation
@@ -48,6 +49,14 @@ cd galleryofbabel
 swift build -c release
 cp .build/release/gobx /usr/local/bin/
 ```
+
+Now just run `gobx explore` and let the setup wizard configure things if needed:
+
+```bash
+gobx explore
+```
+
+By default, `gobx explore` runs endlessly until you stop it. Use `--count` for a finite run.
 
 If you're running in a sandboxed environment (or just want a clean build output), use:
 
@@ -63,7 +72,7 @@ make build SWIFT_BUILD_FLAGS=--disable-sandbox
 
 ## Configuration
 
-To submit findings to the backend, create a configuration file at `~/.config/gallery-of-babel/config.json`:
+If you want to configure manually (instead of using the setup wizard), create a configuration file at `~/.config/gallery-of-babel/config.json`:
 
 ```json
 {
@@ -72,6 +81,10 @@ To submit findings to the backend, create a configuration file at `~/.config/gal
     "id": "YOUR_UUID_HERE",
     "name": "YourDisplayname",
     "xProfile": "yourhandle"
+  },
+  "stats": {
+    "enabled": false,
+    "url": "https://gobx-stats.davelindon.me/ingest"
   }
 }
 ```
@@ -81,14 +94,32 @@ If no profile is configured, `gobx explore` will fall back to the default author
 On first run, `gobx explore` will offer an interactive setup to create this file and optionally run GPU calibration if no config exists.
 You can re-run the setup later with `gobx --setup` or `gobx explore --setup`.
 
+Example wizard run:
+
+```text
+No config found at /Users/you/.config/gallery-of-babel/config.json. Run first-time setup now? [Y/n]
+Configure submission profile now? [Y/n]
+Profile id [user_abcd1234_xyz987654]: 
+Display name [Cosmic-Explorer-AB12]:
+X handle (optional, without @):
+Share anonymized performance stats? [y/N]
+Write config to /Users/you/.config/gallery-of-babel/config.json? [Y/n]
+Wrote config to /Users/you/.config/gallery-of-babel/config.json
+```
+
+### Optional Anonymous Stats
+If you opt in, `gobx explore` sends anonymized performance metrics every 60s and once at exit.
+Use `--stats`/`--no-stats` and `--stats-url` to override config values.
+See `stats-collection/` for a minimal FastAPI + SQLite collector.
+
 ## Usage
 
 ### 1. Exploration (Mining)
 The main command to search for seeds. By default, it uses the GPU backend when available and submits results.
 
 ```bash
-# Run endless exploration (uses GPU if available, otherwise CPU)
-gobx explore --endless
+# Run exploration (uses GPU if available, otherwise CPU)
+gobx explore
 
 # Force CPU-only
 gobx explore --backend cpu --endless
@@ -100,6 +131,11 @@ gobx explore --backend mps --gpu-backend metal --batch 192 --mps-inflight 2
 Defaults:
 - Metal available: `--backend mps --gpu-backend metal --submit --mps-batch-auto --mps-inflight-auto --mps-margin-auto --top-unique-users`
 - Metal unavailable: `--backend cpu --submit --top-unique-users`
+
+Device tuning seeds (used only before a per-device cache exists):
+- M1/M2: batch 256, inflight 2
+- M3/M4/M5: batch 320, inflight 2
+Cached values are stored in `~/.config/gallery-of-babel/gobx-gpu-tuning.json`.
 
 ### 2. Scoring a Specific Seed
 Verify the score of a known seed.
