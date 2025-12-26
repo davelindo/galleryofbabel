@@ -52,11 +52,12 @@ enum StatsCollector {
         let gpuAvg: Double
     }
 
-    static func makePayload(metrics: Metrics) -> Payload? {
+    static func makePayload(metrics: Metrics, runId: String? = nil) -> Payload? {
         guard let device = deviceInfo() else { return nil }
+        let resolvedRunId = runId ?? UUID().uuidString
         return Payload(
             schemaVersion: schemaVersion,
-            runId: UUID().uuidString,
+            runId: resolvedRunId,
             deviceId: device.deviceId,
             hwModel: device.hwModel,
             gpuName: device.gpuName,

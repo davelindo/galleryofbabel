@@ -492,6 +492,7 @@ enum ExploreRunner {
             if let url = config?.stats?.url { return url }
             return StatsCollector.defaultURL
         }()
+        let statsRunId: String? = statsConsent ? UUID().uuidString : nil
 
         var submission: SubmissionManager? = nil
         var refreshTimer: DispatchSourceTimer? = nil
@@ -709,6 +710,82 @@ enum ExploreRunner {
             reportTimer = timer
         }
 
+        func buildStatsMetrics(
+            snap: ExploreStats.Snapshot,
+            lastSnap: ExploreStats.Snapshot,
+            dt: Double,
+            now: UInt64
+        ) -> StatsCollector.Metrics {
+            let cpuDelta = Double(snap.cpuCount &- lastSnap.cpuCount)
+            let cpuVerifyDelta = Double(snap.cpuVerifyCount &- lastSnap.cpuVerifyCount)
+            let mpsDelta = Double(snap.mpsCount &- lastSnap.mpsCount)
+            let cpuRate = cpuDelta / dt
+            let cpuVerifyRate = cpuVerifyDelta / dt
+            let mpsRate = mpsDelta / dt
+
+            let cpuAvg = snap.cpuCount > 0 ? snap.cpuScoreSum / Double(snap.cpuCount) : 0.0
+            let mpsAvg = snap.mpsCount > 0 ? snap.mpsScoreSum / Double(snap.mpsCount) : 0.0
+
+            let totalCount = snap.cpuCount &+ snap.mpsCount &+ snap.cpuVerifyCount
+            let totalDelta = Double(totalCount &- (lastSnap.cpuCount &+ lastSnap.mpsCount &+ lastSnap.cpuVerifyCount))
+            let totalRate = totalDelta / dt
+
+            return StatsCollector.Metrics(
+                backend: resolvedBackendFinal,
+                gpuBackend: gpuBackend,
+                batch: (resolvedBackendFinal == .cpu) ? nil : mpsBatch,
+                inflight: (resolvedBackendFinal == .cpu) ? nil : mpsInflightStart,
+                batchMin: mpsBatchAutoFinal && resolvedBackendFinal != .cpu ? mpsBatchMinFinal : nil,
+                batchMax: mpsBatchAutoFinal && resolvedBackendFinal != .cpu ? mpsBatchMaxFinal : nil,
+                inflightMin: mpsInflightAutoSnapshot && resolvedBackendFinal != .cpu ? mpsInflightMinSnapshot : nil,
+                inflightMax: mpsInflightAutoSnapshot && resolvedBackendFinal != .cpu ? mpsInflightMaxSnapshot : nil,
+                autoBatch: mpsBatchAutoFinal && resolvedBackendFinal != .cpu,
+                autoInflight: mpsInflightAutoSnapshot && resolvedBackendFinal != .cpu,
+                elapsedSec: Double(now - startNs) / 1e9,
+                totalCount: totalCount,
+                totalRate: totalRate,
+                cpuRate: cpuRate + cpuVerifyRate,
+                gpuRate: mpsRate,
+                cpuAvg: cpuAvg,
+                gpuAvg: mpsAvg
+            )
+        }
+
+        var statsTimer: DispatchSourceTimer? = nil
+        if let statsUrl, statsConsent {
+            final class StatsState: @unchecked Sendable {
+                var lastSnap: ExploreStats.Snapshot
+                var lastNs: UInt64
+
+                init(lastSnap: ExploreStats.Snapshot, lastNs: UInt64) {
+                    self.lastSnap = lastSnap
+                    self.lastNs = lastNs
+                }
+            }
+
+            let state = StatsState(lastSnap: stats.snapshot(), lastNs: startNs)
+            let interval = 60.0
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+            timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(1))
+            timer.setEventHandler {
+                if stop.isStopRequested() { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                let snap = stats.snapshot()
+                let dt = Double(now - state.lastNs) / 1e9
+                guard dt > 0 else { return }
+
+                let metrics = buildStatsMetrics(snap: snap, lastSnap: state.lastSnap, dt: dt, now: now)
+                if let payload = StatsCollector.makePayload(metrics: metrics, runId: statsRunId) {
+                    Task { _ = await StatsCollector.send(payload: payload, url: statsUrl) }
+                }
+
+                state.lastSnap = snap
+                state.lastNs = now
+            }
+            timer.resume()
+            statsTimer = timer
+        }
+
         var ui: ExploreLiveUI? = nil
         if uiEnabledFinal, let eventLog {
             ui = ExploreLiveUI(
@@ -730,6 +807,7 @@ enum ExploreRunner {
             ui?.start()
         }
         defer { ui?.stop() }
+        defer { statsTimer?.cancel() }
 
         let group = DispatchGroup()
         let seedAllocatorForWorkers = seedAllocator
@@ -925,7 +1003,7 @@ enum ExploreRunner {
                 cpuAvg: cpuAvg,
                 gpuAvg: mpsAvg
             )
-            if let payload = StatsCollector.makePayload(metrics: metrics) {
+            if let payload = StatsCollector.makePayload(metrics: metrics, runId: statsRunId) {
                 let ok = await StatsCollector.send(payload: payload, url: statsUrl)
                 if !ok {
                     emit(.warning, "Anonymous stats upload failed (url=\(statsUrl))")
