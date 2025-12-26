@@ -306,80 +306,82 @@ final class MetalPyramidScorer: GPUScorer {
     }
 
     func enqueue(seeds: UnsafeBufferPointer<UInt64>, count: Int) -> Job {
-        precondition(count >= 0 && count <= batchSize)
-        let slotIndex = enqueueCursor
-        let slot = slots[slotIndex]
-        enqueueCursor = (enqueueCursor + 1) % inflight
+        autoreleasepool {
+            precondition(count >= 0 && count <= batchSize)
+            let slotIndex = enqueueCursor
+            let slot = slots[slotIndex]
+            enqueueCursor = (enqueueCursor + 1) % inflight
 
-        slot.resetError()
+            slot.resetError()
 
-        let inPtr = slot.inputPtr
-        if count > 0 {
-            precondition(seeds.baseAddress != nil)
-            memcpy(inPtr, seeds.baseAddress!, count * MemoryLayout<UInt64>.stride)
-        }
-        if count < batchSize {
-            memset(inPtr.advanced(by: count), 0, (batchSize - count) * MemoryLayout<UInt64>.stride)
-        }
-
-        let params = ProxyParams(
-            count: UInt32(count),
-            levelCount: UInt32(levelCount),
-            weightCount: UInt32(weightCount),
-            includeNeighborCorr: includeNeighborCorr ? 1 : 0,
-            bias: bias,
-            eps: eps
-        )
-        slot.paramsPtr.pointee = params
-
-        let job = Job(slotIndex: slotIndex, count: count)
-        var batchToFinalize: CommandBatch? = nil
-        batchLock.lock()
-        if pendingBatch == nil {
-            let commandBuffer = commandQueue.makeCommandBuffer(descriptor: commandBufferDescriptor)
-                ?? commandQueue.makeCommandBuffer()
-            guard let commandBuffer else {
-                batchLock.unlock()
-                slot.setError(MetalPyramidScorerError.noCommandQueue)
-                slot.done.signal()
-                return job
+            let inPtr = slot.inputPtr
+            if count > 0 {
+                precondition(seeds.baseAddress != nil)
+                memcpy(inPtr, seeds.baseAddress!, count * MemoryLayout<UInt64>.stride)
             }
-            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-                batchLock.unlock()
-                slot.setError(MetalPyramidScorerError.pipelineInitFailed)
-                slot.done.signal()
-                return job
+            if count < batchSize {
+                memset(inPtr.advanced(by: count), 0, (batchSize - count) * MemoryLayout<UInt64>.stride)
             }
-            encoder.setComputePipelineState(pipeline)
-            pendingBatch = CommandBatch(
-                commandBuffer: commandBuffer,
-                encoder: encoder,
-                capacity: dispatchesPerCommandBuffer
+
+            let params = ProxyParams(
+                count: UInt32(count),
+                levelCount: UInt32(levelCount),
+                weightCount: UInt32(weightCount),
+                includeNeighborCorr: includeNeighborCorr ? 1 : 0,
+                bias: bias,
+                eps: eps
             )
-        }
-        if let batch = pendingBatch {
-            batch.encoder.setBuffer(slot.inputBuffer, offset: 0, index: 0)
-            batch.encoder.setBuffer(weightsBuffer, offset: 0, index: 1)
-            batch.encoder.setBuffer(slot.paramsBuffer, offset: 0, index: 2)
-            batch.encoder.setBuffer(slot.outputBuffer, offset: 0, index: 3)
+            slot.paramsPtr.pointee = params
 
-            let tgSize = MTLSize(width: threadgroupSize, height: 1, depth: 1)
-            let tgCount = MTLSize(width: batchSize, height: 1, depth: 1)
-            batch.encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-
-            batch.slots.append(slotIndex)
-            batch.count += 1
-            if batch.count >= dispatchesPerCommandBuffer {
-                pendingBatch = nil
-                batchToFinalize = batch
+            let job = Job(slotIndex: slotIndex, count: count)
+            var batchToFinalize: CommandBatch? = nil
+            batchLock.lock()
+            if pendingBatch == nil {
+                let commandBuffer = commandQueue.makeCommandBuffer(descriptor: commandBufferDescriptor)
+                    ?? commandQueue.makeCommandBuffer()
+                guard let commandBuffer else {
+                    batchLock.unlock()
+                    slot.setError(MetalPyramidScorerError.noCommandQueue)
+                    slot.done.signal()
+                    return job
+                }
+                guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                    batchLock.unlock()
+                    slot.setError(MetalPyramidScorerError.pipelineInitFailed)
+                    slot.done.signal()
+                    return job
+                }
+                encoder.setComputePipelineState(pipeline)
+                pendingBatch = CommandBatch(
+                    commandBuffer: commandBuffer,
+                    encoder: encoder,
+                    capacity: dispatchesPerCommandBuffer
+                )
             }
-        }
-        batchLock.unlock()
-        if let batchToFinalize {
-            finalizeBatch(batchToFinalize)
-        }
+            if let batch = pendingBatch {
+                batch.encoder.setBuffer(slot.inputBuffer, offset: 0, index: 0)
+                batch.encoder.setBuffer(weightsBuffer, offset: 0, index: 1)
+                batch.encoder.setBuffer(slot.paramsBuffer, offset: 0, index: 2)
+                batch.encoder.setBuffer(slot.outputBuffer, offset: 0, index: 3)
 
-        return job
+                let tgSize = MTLSize(width: threadgroupSize, height: 1, depth: 1)
+                let tgCount = MTLSize(width: batchSize, height: 1, depth: 1)
+                batch.encoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
+
+                batch.slots.append(slotIndex)
+                batch.count += 1
+                if batch.count >= dispatchesPerCommandBuffer {
+                    pendingBatch = nil
+                    batchToFinalize = batch
+                }
+            }
+            batchLock.unlock()
+            if let batchToFinalize {
+                finalizeBatch(batchToFinalize)
+            }
+
+            return job
+        }
     }
 
     func withCompletedJob<T>(_ job: Job, _ body: (UnsafeBufferPointer<UInt64>, UnsafeBufferPointer<Float>) throws -> T) throws -> T {
@@ -417,16 +419,18 @@ final class MetalPyramidScorer: GPUScorer {
     }
 
     private func finalizeBatch(_ batch: CommandBatch) {
-        batch.encoder.endEncoding()
-        let slotIndices = batch.slots
-        let slots = self.slots
-        batch.commandBuffer.addCompletedHandler { buffer in
-            for idx in slotIndices {
-                let slot = slots[idx]
-                slot.setError(buffer.error)
-                slot.done.signal()
+        autoreleasepool {
+            batch.encoder.endEncoding()
+            let slotIndices = batch.slots
+            let slots = self.slots
+            batch.commandBuffer.addCompletedHandler { buffer in
+                for idx in slotIndices {
+                    let slot = slots[idx]
+                    slot.setError(buffer.error)
+                    slot.done.signal()
+                }
             }
+            batch.commandBuffer.commit()
         }
-        batch.commandBuffer.commit()
     }
 }
