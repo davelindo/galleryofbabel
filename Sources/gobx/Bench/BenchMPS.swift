@@ -520,8 +520,16 @@ enum BenchMPS {
 
             let sampleCount = max(1, Int(ceil(durationSeconds * 1000.0 / Double(intervalMs))))
             let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: exe)
-            proc.arguments = ["--samplers", "gpu_power", "-i", String(intervalMs), "-n", String(sampleCount)]
+            let args = ["--samplers", "gpu_power", "-i", String(intervalMs), "-n", String(sampleCount)]
+            if geteuid() == 0 {
+                proc.executableURL = URL(fileURLWithPath: exe)
+                proc.arguments = args
+            } else {
+                let sudoExe = "/usr/bin/sudo"
+                guard FileManager.default.isExecutableFile(atPath: sudoExe) else { return }
+                proc.executableURL = URL(fileURLWithPath: sudoExe)
+                proc.arguments = ["-n", exe] + args
+            }
             proc.standardOutput = outPipe
             proc.standardError = errPipe
             do {

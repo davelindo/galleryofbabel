@@ -19,13 +19,18 @@ It features a dual-backend architecture:
 
 ## Performance
 
-| Hardware | Device ID | Backend | Throughput | Power | Efficiency | Best Score | Rarity |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **2.04M seeds/s** | ~40W | **183.4M seeds/Wh** | `-8.504137` | ~1 in 5.99e11 |
+| Date | Hardware | Device ID | Backend | Throughput | Power | Efficiency |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 2025-12-26 | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | MPS (GPU) | **4.78M seeds/s** | ~46W | **374.1M seeds/Wh** |
+| n/a | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **2.04M seeds/s** | ~40W | **183.4M seeds/Wh** |
 
-*Efficiency calculated as (Seeds per Second * 3600) / Watts. Rarity estimated from /api/stats total generations at time of run (score ≥ current #1).*
+*Efficiency calculated as (Seeds per Second * 3600) / Watts.*
 
 > **Note:** Please open a PR to add your hardware and findings!
+
+## Results
+
+This approach reached the #1 spot on the Gallery of Babel leaderboard.
 
 ## Requirements
 

@@ -64,18 +64,28 @@ final class MPSScorer: GPUScorer {
 
     private final class Slot {
         let inputBuffer: MTLBuffer
+        let inputPtr: UnsafeMutablePointer<UInt64>
         let inputTensorData: MPSGraphTensorData
         let outputBuffer: MTLBuffer
+        let outputPtr: UnsafeMutablePointer<Float>
         let outputTensorData: MPSGraphTensorData
         let executionDescriptor: MPSGraphExecutableExecutionDescriptor
         let done: DispatchSemaphore
         private let lock = NSLock()
         private var lastError: Error? = nil
 
-        init(inputBuffer: MTLBuffer, inputTensorData: MPSGraphTensorData, outputBuffer: MTLBuffer, outputTensorData: MPSGraphTensorData) {
+        init(
+            inputBuffer: MTLBuffer,
+            inputTensorData: MPSGraphTensorData,
+            outputBuffer: MTLBuffer,
+            outputTensorData: MPSGraphTensorData,
+            batchSize: Int
+        ) {
             self.inputBuffer = inputBuffer
+            self.inputPtr = inputBuffer.contents().bindMemory(to: UInt64.self, capacity: batchSize)
             self.inputTensorData = inputTensorData
             self.outputBuffer = outputBuffer
+            self.outputPtr = outputBuffer.contents().bindMemory(to: Float.self, capacity: batchSize)
             self.outputTensorData = outputTensorData
             self.done = DispatchSemaphore(value: 0)
 
@@ -164,21 +174,29 @@ final class MPSScorer: GPUScorer {
 
         let inLen = batchSize * MemoryLayout<UInt64>.stride
         let outLen = batchSize * MemoryLayout<Float>.stride
+        let inputOptions: MTLResourceOptions = [.storageModeShared, .cpuCacheModeWriteCombined]
+        let outputOptions: MTLResourceOptions = [.storageModeShared]
 
         var slots: [Slot] = []
         slots.reserveCapacity(inflight)
         for idx in 0..<inflight {
-            guard let inBuf = device.makeBuffer(length: inLen, options: .storageModeShared) else {
+            guard let inBuf = device.makeBuffer(length: inLen, options: inputOptions) else {
                 throw MPSScorerError.bufferAllocationFailed(name: "input[\(idx)]", length: inLen)
             }
             let inTD = MPSGraphTensorData(inBuf, shape: [NSNumber(value: batchSize)], dataType: .uInt64)
 
-            guard let outBuf = device.makeBuffer(length: outLen, options: .storageModeShared) else {
+            guard let outBuf = device.makeBuffer(length: outLen, options: outputOptions) else {
                 throw MPSScorerError.bufferAllocationFailed(name: "output[\(idx)]", length: outLen)
             }
             let outTD = MPSGraphTensorData(outBuf, shape: outputShape, dataType: .float32)
 
-            slots.append(Slot(inputBuffer: inBuf, inputTensorData: inTD, outputBuffer: outBuf, outputTensorData: outTD))
+            slots.append(Slot(
+                inputBuffer: inBuf,
+                inputTensorData: inTD,
+                outputBuffer: outBuf,
+                outputTensorData: outTD,
+                batchSize: batchSize
+            ))
         }
         self.slots = slots
 
@@ -228,7 +246,7 @@ final class MPSScorer: GPUScorer {
 
         slot.resetError()
 
-        let inPtr = slot.inputBuffer.contents().bindMemory(to: UInt64.self, capacity: batchSize)
+        let inPtr = slot.inputPtr
         if count > 0 {
             precondition(seeds.baseAddress != nil)
             memcpy(inPtr, seeds.baseAddress!, count * MemoryLayout<UInt64>.stride)
@@ -258,8 +276,8 @@ final class MPSScorer: GPUScorer {
             throw e
         }
 
-        let seedsPtr = slot.inputBuffer.contents().bindMemory(to: UInt64.self, capacity: batchSize)
-        let outPtr = slot.outputBuffer.contents().bindMemory(to: Float.self, capacity: outputElementCount)
+        let seedsPtr = slot.inputPtr
+        let outPtr = slot.outputPtr
         return try body(
             UnsafeBufferPointer(start: seedsPtr, count: job.count),
             UnsafeBufferPointer(start: outPtr, count: job.count)

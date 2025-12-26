@@ -8,7 +8,7 @@ Usage:
   gobx score <seed> [--backend cpu|mps] [--batch <n>] [--gpu-backend mps|metal] [--json]
   gobx selftest [--golden <path>] [--write-golden] [--count <n>] [--limit <n>] [--tolerance <x>]
   gobx bench-mps [--seconds <s>] [--warmup <s>] [--warmup-batches <n>] [--reps <n>] [--batches <csv>] [--size <n>] [--gpu-util] [--gpu-interval-ms <n>] [--inflight <n>] [--opt 0|1] [--log-dir <path>] [--json]
-  gobx bench-metal [--seconds <s>] [--warmup <s>] [--reps <n>] [--batches <csv>] [--size <n>] [--inflight <n>]
+  gobx bench-metal [--seconds <s>] [--warmup <s>] [--reps <n>] [--batches <csv>] [--size <n>] [--inflight <n>] [--tg <n>] [--cb-dispatches <n>] [--gpu-util] [--gpu-interval-ms <n>] [--gpu-trace <path>]
   gobx calibrate-mps [--batch <n>] [--scan <n>] [--top <n>] [--quantile <q>] [--opt 0|1] [--out <path>] [--force]
   gobx calibrate-metal [--batch <n>] [--scan <n>] [--top <n>] [--quantile <q>] [--inflight <n>] [--out <path>] [--force]
   gobx proxy-eval [--n <n>] [--top <n>] [--gate <csv>] [--seed <seed>] [--weights <path>] [--gpu-backend mps|metal] [--report-every <sec>]

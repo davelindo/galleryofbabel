@@ -128,7 +128,8 @@ enum CalibrateMPS {
         print("Calibrating MPS vs CPU (batch=\(batch) scan=\(scanCount) top=\(topCount) q=\(String(format: "%.4f", quantile)) opt=\(optLevel))")
         print("Hardware hash: \(hash)")
 
-        let mps = try MPSScorer(batchSize: batch, optimizationLevel: opt)
+        let inflight = 2
+        let mps = try MPSScorer(batchSize: batch, inflight: inflight, optimizationLevel: opt)
 
         var heap = MinHeap<SeedScoreEntry>()
         heap.reserveCapacity(min(topCount, 16384))
@@ -140,26 +141,40 @@ enum CalibrateMPS {
         let scanAligned = scanCount - (scanCount % batch)
         let scanFinal = max(batch, scanAligned)
         var processed = 0
+        var enqueued = 0
         let startNs = DispatchTime.now().uptimeNanoseconds
         var lastPrintNs = startNs
 
         var seeds = [UInt64](repeating: 0, count: batch)
-        while processed < scanFinal {
-            let n = min(batch, scanFinal - processed)
-            for i in 0..<n {
-                seeds[i] = seed
-                seed = nextV2Seed(seed, by: 1)
+        var pending: [GPUJob] = []
+        pending.reserveCapacity(inflight)
+        while enqueued < scanFinal || !pending.isEmpty {
+            while enqueued < scanFinal && pending.count < inflight {
+                let n = min(batch, scanFinal - enqueued)
+                for i in 0..<n {
+                    seeds[i] = seed
+                    seed = nextV2Seed(seed, by: 1)
+                }
+                if n < batch {
+                    for i in n..<batch { seeds[i] = 0 }
+                }
+                let job = seeds.withUnsafeBufferPointer { ptr in
+                    mps.enqueue(seeds: ptr, count: n)
+                }
+                pending.append(job)
+                enqueued += n
             }
-            if n < batch {
-                for i in n..<batch { seeds[i] = 0 }
+
+            if pending.isEmpty { break }
+            let job = pending.removeFirst()
+            try mps.withCompletedJob(job) { seedsBuf, scoresBuf in
+                for i in 0..<job.count {
+                    let sc = scoresBuf[i]
+                    guard sc.isFinite else { continue }
+                    heap.keepLargest(SeedScoreEntry(score: sc, seed: seedsBuf[i]), limit: topCount)
+                }
             }
-            let scores = mps.score(seeds: seeds)
-            for i in 0..<n {
-                let sc = scores[i]
-                guard sc.isFinite else { continue }
-                heap.keepLargest(SeedScoreEntry(score: sc, seed: seeds[i]), limit: topCount)
-            }
-            processed += n
+            processed += job.count
 
             let now = DispatchTime.now().uptimeNanoseconds
             if now &- lastPrintNs >= 1_000_000_000 {

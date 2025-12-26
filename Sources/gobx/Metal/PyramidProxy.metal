@@ -1,7 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-constant uint kThreads = 256;
+constant uint kThreads [[function_constant(0)]];
+constant uint kSimdWidth = 32;
+constant uint kMaxSimdGroups = 8;
 constant uint kMaxBlocks = 4096; // 64x64
 constant uint kMaxLevels = 7;
 
@@ -46,31 +48,34 @@ kernel void pyramid_proxy(
     constant ProxyParams &params [[buffer(2)]],
     device float *scores [[buffer(3)]],
     uint tgId [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]
+    uint tid [[thread_index_in_threadgroup]],
+    uint simdId [[simdgroup_index_in_threadgroup]],
+    uint simdTid [[thread_index_in_simdgroup]]
 ) {
     if (tgId >= params.count) { return; }
 
     threadgroup half bufA[kMaxBlocks];
     threadgroup half bufB[kMaxBlocks];
-    threadgroup float sumShared[kThreads];
-    threadgroup float sum2Shared[kThreads];
-    threadgroup float maxShared[kThreads];
-    threadgroup float sumAxShared[kThreads];
-    threadgroup float sumBxShared[kThreads];
-    threadgroup float sumAx2Shared[kThreads];
-    threadgroup float sumBx2Shared[kThreads];
-    threadgroup float sumABxShared[kThreads];
-    threadgroup float sumAyShared[kThreads];
-    threadgroup float sumByShared[kThreads];
-    threadgroup float sumAy2Shared[kThreads];
-    threadgroup float sumBy2Shared[kThreads];
-    threadgroup float sumAByShared[kThreads];
+    threadgroup float sumShared[kMaxSimdGroups];
+    threadgroup float sum2Shared[kMaxSimdGroups];
+    threadgroup float maxShared[kMaxSimdGroups];
+    threadgroup float sumAxShared[kMaxSimdGroups];
+    threadgroup float sumBxShared[kMaxSimdGroups];
+    threadgroup float sumAx2Shared[kMaxSimdGroups];
+    threadgroup float sumBx2Shared[kMaxSimdGroups];
+    threadgroup float sumABxShared[kMaxSimdGroups];
+    threadgroup float sumAyShared[kMaxSimdGroups];
+    threadgroup float sumByShared[kMaxSimdGroups];
+    threadgroup float sumAy2Shared[kMaxSimdGroups];
+    threadgroup float sumBy2Shared[kMaxSimdGroups];
+    threadgroup float sumAByShared[kMaxSimdGroups];
     threadgroup float energies[kMaxLevels];
     threadgroup float maxes[kMaxLevels];
     threadgroup float e2s[kMaxLevels];
     threadgroup float neighborCorrValue;
 
     const uint levelCount = params.levelCount;
+    const uint simdGroups = kThreads / kSimdWidth;
     if (levelCount == 0 || levelCount > kMaxLevels) {
         if (tid == 0) { scores[tgId] = params.bias; }
         return;
@@ -114,95 +119,115 @@ kernel void pyramid_proxy(
     uint seedHi = (uint)(seed >> 32);
     uint hiMix = seedHi * 0x9E3779B9u;
 
-    uint currentDim = 128;
     uint nextDim = 64;
     bool srcIsA = false;
 
     for (uint level = 0; level < levelCount; ++level) {
-        uint blocks = nextDim * nextDim;
+        uint shift = 6u - level;
+        uint currentDim = nextDim << 1u;
+        uint blocks = nextDim << shift;
+        uint mask = nextDim - 1u;
         float sumVar = 0.0f;
         float sumVar2 = 0.0f;
         float maxVar = 0.0f;
         bool trackShape = (level == shapeA) || (shapeCount == 2u && level == shapeB);
 
-        for (uint i = tid; i < blocks; i += kThreads) {
-            uint y = i / nextDim;
-            uint x = i - (y * nextDim);
-            uint baseRow = y * 2u;
-            uint baseCol = x * 2u;
-
-            float v00, v01, v10, v11;
-            if (level == 0) {
-                uint idx0 = baseRow * currentDim + baseCol;
+        threadgroup half *dst = srcIsA ? bufB : bufA;
+        if (level == 0) {
+            for (uint i = tid; i < blocks; i += kThreads) {
+                uint y = i >> shift;
+                uint x = i & mask;
+                uint rowBase = y << (shift + 2u);
+                uint idx0 = rowBase + (x << 1u);
                 uint idx1 = idx0 + 1u;
                 uint idx2 = idx0 + currentDim;
                 uint idx3 = idx2 + 1u;
-                v00 = samplePixel(seedLo, hiMix, idx0);
-                v01 = samplePixel(seedLo, hiMix, idx1);
-                v10 = samplePixel(seedLo, hiMix, idx2);
-                v11 = samplePixel(seedLo, hiMix, idx3);
-            } else {
-                threadgroup half *src = srcIsA ? bufA : bufB;
-                uint idx0 = baseRow * currentDim + baseCol;
+                float v00 = samplePixel(seedLo, hiMix, idx0);
+                float v01 = samplePixel(seedLo, hiMix, idx1);
+                float v10 = samplePixel(seedLo, hiMix, idx2);
+                float v11 = samplePixel(seedLo, hiMix, idx3);
+
+                float m = 0.25f * (v00 + v01 + v10 + v11);
+                float m2 = 0.25f * (v00 * v00 + v01 * v01 + v10 * v10 + v11 * v11);
+                float varVal = m2 - m * m;
+                if (varVal < 0.0f) { varVal = 0.0f; }
+
+                sumVar += varVal;
+                if (trackShape) {
+                    sumVar2 += varVal * varVal;
+                    if (varVal > maxVar) { maxVar = varVal; }
+                }
+
+                dst[i] = half(m);
+            }
+        } else {
+            threadgroup half *src = srcIsA ? bufA : bufB;
+            for (uint i = tid; i < blocks; i += kThreads) {
+                uint y = i >> shift;
+                uint x = i & mask;
+                uint rowBase = y << (shift + 2u);
+                uint idx0 = rowBase + (x << 1u);
                 uint idx1 = idx0 + 1u;
                 uint idx2 = idx0 + currentDim;
                 uint idx3 = idx2 + 1u;
-                v00 = float(src[idx0]);
-                v01 = float(src[idx1]);
-                v10 = float(src[idx2]);
-                v11 = float(src[idx3]);
+                float v00 = float(src[idx0]);
+                float v01 = float(src[idx1]);
+                float v10 = float(src[idx2]);
+                float v11 = float(src[idx3]);
+
+                float m = 0.25f * (v00 + v01 + v10 + v11);
+                float m2 = 0.25f * (v00 * v00 + v01 * v01 + v10 * v10 + v11 * v11);
+                float varVal = m2 - m * m;
+                if (varVal < 0.0f) { varVal = 0.0f; }
+
+                sumVar += varVal;
+                if (trackShape) {
+                    sumVar2 += varVal * varVal;
+                    if (varVal > maxVar) { maxVar = varVal; }
+                }
+
+                dst[i] = half(m);
             }
-
-            float m = 0.25f * (v00 + v01 + v10 + v11);
-            float m2 = 0.25f * (v00 * v00 + v01 * v01 + v10 * v10 + v11 * v11);
-            float varVal = m2 - m * m;
-            if (varVal < 0.0f) { varVal = 0.0f; }
-
-            sumVar += varVal;
-            if (trackShape) {
-                sumVar2 += varVal * varVal;
-                if (varVal > maxVar) { maxVar = varVal; }
-            }
-
-            threadgroup half *dst = srcIsA ? bufB : bufA;
-            dst[i] = half(m);
         }
 
-        sumShared[tid] = sumVar;
-        sum2Shared[tid] = sumVar2;
-        maxShared[tid] = maxVar;
+        float sumVarSimd = simd_sum(sumVar);
+        float sumVar2Simd = simd_sum(sumVar2);
+        float maxVarSimd = simd_max(maxVar);
+        if (simdTid == 0u) {
+            sumShared[simdId] = sumVarSimd;
+            sum2Shared[simdId] = sumVar2Simd;
+            maxShared[simdId] = maxVarSimd;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint stride = kThreads / 2u; stride > 0; stride >>= 1u) {
-            if (tid < stride) {
-                sumShared[tid] += sumShared[tid + stride];
-                sum2Shared[tid] += sum2Shared[tid + stride];
-                maxShared[tid] = max(maxShared[tid], maxShared[tid + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        if (tid == 0) {
-            float count = (float)blocks;
-            energies[level] = sumShared[0] / count;
-            if (trackShape) {
-                maxes[level] = maxShared[0];
-                e2s[level] = sum2Shared[0] / count;
+        if (simdId == 0u) {
+            float sumTotal = simd_sum(simdTid < simdGroups ? sumShared[simdTid] : 0.0f);
+            float sum2Total = simd_sum(simdTid < simdGroups ? sum2Shared[simdTid] : 0.0f);
+            float maxTotal = simd_max(simdTid < simdGroups ? maxShared[simdTid] : 0.0f);
+            if (simdTid == 0u) {
+                float count = (float)blocks;
+                energies[level] = sumTotal / count;
+                if (trackShape) {
+                    maxes[level] = maxTotal;
+                    e2s[level] = sum2Total / count;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (includeNeighbor && level == 0u) {
             threadgroup half *dst = srcIsA ? bufB : bufA;
-            uint nX = nextDim * (nextDim - 1u);
+            uint rowStride = nextDim - 1u;
+            uint nX = nextDim * rowStride;
             float sumAx = 0.0f;
             float sumBx = 0.0f;
             float sumAx2 = 0.0f;
             float sumBx2 = 0.0f;
             float sumABx = 0.0f;
-            for (uint idx = tid; idx < nX; idx += kThreads) {
-                uint y = idx / (nextDim - 1u);
-                uint x = idx - y * (nextDim - 1u);
+            uint idx = tid;
+            uint y = (rowStride > 0u) ? (idx / rowStride) : 0u;
+            uint x = (rowStride > 0u) ? (idx - y * rowStride) : 0u;
+            while (idx < nX) {
                 uint base = y * nextDim + x;
                 float a = float(dst[base]);
                 float b = float(dst[base + 1u]);
@@ -211,35 +236,38 @@ kernel void pyramid_proxy(
                 sumAx2 += a * a;
                 sumBx2 += b * b;
                 sumABx += a * b;
+
+                idx += kThreads;
+                x += kThreads;
+                while (x >= rowStride && rowStride > 0u) {
+                    x -= rowStride;
+                    y += 1u;
+                }
             }
-            sumAxShared[tid] = sumAx;
-            sumBxShared[tid] = sumBx;
-            sumAx2Shared[tid] = sumAx2;
-            sumBx2Shared[tid] = sumBx2;
-            sumABxShared[tid] = sumABx;
+            float sumAxSimd = simd_sum(sumAx);
+            float sumBxSimd = simd_sum(sumBx);
+            float sumAx2Simd = simd_sum(sumAx2);
+            float sumBx2Simd = simd_sum(sumBx2);
+            float sumABxSimd = simd_sum(sumABx);
+            if (simdTid == 0u) {
+                sumAxShared[simdId] = sumAxSimd;
+                sumBxShared[simdId] = sumBxSimd;
+                sumAx2Shared[simdId] = sumAx2Simd;
+                sumBx2Shared[simdId] = sumBx2Simd;
+                sumABxShared[simdId] = sumABxSimd;
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint stride = kThreads / 2u; stride > 0; stride >>= 1u) {
-                if (tid < stride) {
-                    sumAxShared[tid] += sumAxShared[tid + stride];
-                    sumBxShared[tid] += sumBxShared[tid + stride];
-                    sumAx2Shared[tid] += sumAx2Shared[tid + stride];
-                    sumBx2Shared[tid] += sumBx2Shared[tid + stride];
-                    sumABxShared[tid] += sumABxShared[tid + stride];
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            uint nY = (nextDim - 1u) * nextDim;
+            uint nY = rowStride * nextDim;
             float sumAy = 0.0f;
             float sumBy = 0.0f;
             float sumAy2 = 0.0f;
             float sumBy2 = 0.0f;
             float sumABy = 0.0f;
             for (uint idx = tid; idx < nY; idx += kThreads) {
-                uint y = idx / nextDim;
-                uint x = idx - y * nextDim;
-                uint base = y * nextDim + x;
+                uint y = idx >> shift;
+                uint x = idx & mask;
+                uint base = (y << shift) + x;
                 float a = float(dst[base]);
                 float b = float(dst[base + nextDim]);
                 sumAy += a;
@@ -248,34 +276,41 @@ kernel void pyramid_proxy(
                 sumBy2 += b * b;
                 sumABy += a * b;
             }
-            sumAyShared[tid] = sumAy;
-            sumByShared[tid] = sumBy;
-            sumAy2Shared[tid] = sumAy2;
-            sumBy2Shared[tid] = sumBy2;
-            sumAByShared[tid] = sumABy;
+            float sumAySimd = simd_sum(sumAy);
+            float sumBySimd = simd_sum(sumBy);
+            float sumAy2Simd = simd_sum(sumAy2);
+            float sumBy2Simd = simd_sum(sumBy2);
+            float sumABySimd = simd_sum(sumABy);
+            if (simdTid == 0u) {
+                sumAyShared[simdId] = sumAySimd;
+                sumByShared[simdId] = sumBySimd;
+                sumAy2Shared[simdId] = sumAy2Simd;
+                sumBy2Shared[simdId] = sumBy2Simd;
+                sumAByShared[simdId] = sumABySimd;
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint stride = kThreads / 2u; stride > 0; stride >>= 1u) {
-                if (tid < stride) {
-                    sumAyShared[tid] += sumAyShared[tid + stride];
-                    sumByShared[tid] += sumByShared[tid + stride];
-                    sumAy2Shared[tid] += sumAy2Shared[tid + stride];
-                    sumBy2Shared[tid] += sumBy2Shared[tid + stride];
-                    sumAByShared[tid] += sumAByShared[tid + stride];
+            if (simdId == 0u) {
+                float sumAxTotal = simd_sum(simdTid < simdGroups ? sumAxShared[simdTid] : 0.0f);
+                float sumBxTotal = simd_sum(simdTid < simdGroups ? sumBxShared[simdTid] : 0.0f);
+                float sumAx2Total = simd_sum(simdTid < simdGroups ? sumAx2Shared[simdTid] : 0.0f);
+                float sumBx2Total = simd_sum(simdTid < simdGroups ? sumBx2Shared[simdTid] : 0.0f);
+                float sumABxTotal = simd_sum(simdTid < simdGroups ? sumABxShared[simdTid] : 0.0f);
+                float sumAyTotal = simd_sum(simdTid < simdGroups ? sumAyShared[simdTid] : 0.0f);
+                float sumByTotal = simd_sum(simdTid < simdGroups ? sumByShared[simdTid] : 0.0f);
+                float sumAy2Total = simd_sum(simdTid < simdGroups ? sumAy2Shared[simdTid] : 0.0f);
+                float sumBy2Total = simd_sum(simdTid < simdGroups ? sumBy2Shared[simdTid] : 0.0f);
+                float sumAByTotal = simd_sum(simdTid < simdGroups ? sumAByShared[simdTid] : 0.0f);
+                if (simdTid == 0u) {
+                    float corrX = corr(sumAxTotal, sumBxTotal, sumAx2Total, sumBx2Total, sumABxTotal, nX, params.eps);
+                    float corrY = corr(sumAyTotal, sumByTotal, sumAy2Total, sumBy2Total, sumAByTotal, nY, params.eps);
+                    neighborCorrValue = 0.5f * (corrX + corrY);
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            if (tid == 0) {
-                float corrX = corr(sumAxShared[0], sumBxShared[0], sumAx2Shared[0], sumBx2Shared[0], sumABxShared[0], nX, params.eps);
-                float corrY = corr(sumAyShared[0], sumByShared[0], sumAy2Shared[0], sumBy2Shared[0], sumAByShared[0], nY, params.eps);
-                neighborCorrValue = 0.5f * (corrX + corrY);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         srcIsA = !srcIsA;
-        currentDim = nextDim;
         nextDim >>= 1u;
         if (nextDim == 0) { break; }
     }
