@@ -42,7 +42,12 @@ jobs:
           arch="$(uname -m)"
           mkdir -p dist
           cp .build/release/gobx dist/
-          tar -czf "gobx-macos-${arch}.tar.gz" -C dist gobx
+          if [[ -d ".build/release/gobx_gobx.bundle" ]]; then
+            cp -R .build/release/gobx_gobx.bundle dist/
+          elif [[ -d ".build/release/gobx_GobxCore.bundle" ]]; then
+            cp -R .build/release/gobx_GobxCore.bundle dist/gobx_gobx.bundle
+          fi
+          tar -czf "gobx-macos-${arch}.tar.gz" -C dist gobx gobx_gobx.bundle
           shasum -a 256 "gobx-macos-${arch}.tar.gz" > "gobx-macos-${arch}.tar.gz.sha256"
 
       - name: Update nightly tag
