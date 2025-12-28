@@ -33,5 +33,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gobx-macos-${{ runner.arch }}
-          path: ./.build/release/gobx
+          path: |
+            ./.build/release/gobx
+            ./.build/release/gobx_gobx.bundle
           if-no-files-found: error
