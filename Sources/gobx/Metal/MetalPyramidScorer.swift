@@ -50,7 +50,7 @@ enum MetalPyramidScorerError: Error, CustomStringConvertible {
 }
 
 final class MetalPyramidScorer: GPUScorer {
-    static let scorerVersion: Int = 4
+    static let scorerVersion: Int = 5
     static let defaultThreadgroupSize: Int = 192
     static let simdWidth: Int = 32
     static let maxSimdGroups: Int = 8
@@ -79,6 +79,11 @@ final class MetalPyramidScorer: GPUScorer {
     private let bias: Float
     private let eps: Float
     private let includeNeighborCorr: Bool
+    private let includeAlphaFeature: Bool
+    private let includeLogEnergyFeatures: Bool
+    private let includeEnergies: Bool
+    private let includeShapeFeatures: Bool
+    private let ratioCount: Int
     private let dispatchesPerCommandBuffer: Int
 
     private var scoreBuffer: [Float]
@@ -90,6 +95,11 @@ final class MetalPyramidScorer: GPUScorer {
         var levelCount: UInt32
         var weightCount: UInt32
         var includeNeighborCorr: UInt32
+        var includeAlphaFeature: UInt32
+        var includeLogEnergyFeatures: UInt32
+        var includeEnergies: UInt32
+        var includeShapeFeatures: UInt32
+        var ratioCount: UInt32
         var bias: Float
         var eps: Float
     }
@@ -226,6 +236,12 @@ final class MetalPyramidScorer: GPUScorer {
         self.eps = Float(ScoringConstants.eps)
         precondition(!proxyConfig.includeNeighborPenalty, "Metal proxy does not implement neighbor correlation penalty")
         self.includeNeighborCorr = proxyConfig.includeNeighborCorrFeature
+        self.includeAlphaFeature = proxyConfig.includeAlphaFeature
+        self.includeLogEnergyFeatures = proxyConfig.includeLogEnergyFeatures
+        self.includeEnergies = proxyConfig.includeEnergies
+        self.includeShapeFeatures = proxyConfig.includeShapeFeatures
+        let ratioLimit = max(0, proxyConfig.maxRatioLevels ?? (levels - 1))
+        self.ratioCount = min(max(0, levels - 1), ratioLimit)
 
         let featureCount = WaveletProxy.featureCount(for: imageSize, config: proxyConfig)
         let weightsURL = GobxPaths.metalProxyWeightsURL
@@ -328,6 +344,11 @@ final class MetalPyramidScorer: GPUScorer {
                 levelCount: UInt32(levelCount),
                 weightCount: UInt32(weightCount),
                 includeNeighborCorr: includeNeighborCorr ? 1 : 0,
+                includeAlphaFeature: includeAlphaFeature ? 1 : 0,
+                includeLogEnergyFeatures: includeLogEnergyFeatures ? 1 : 0,
+                includeEnergies: includeEnergies ? 1 : 0,
+                includeShapeFeatures: includeShapeFeatures ? 1 : 0,
+                ratioCount: UInt32(ratioCount),
                 bias: bias,
                 eps: eps
             )

@@ -34,6 +34,14 @@ final class ExploreEventLog: @unchecked Sendable {
         }
     }
 
+    func updateLast(kind: ExploreEventKind, from oldMessage: String, to newMessage: String) -> Bool {
+        lock.withLock {
+            guard let last = events.last, last.kind == kind, last.message == oldMessage else { return false }
+            events[events.count - 1] = ExploreEvent(time: last.time, kind: kind, message: newMessage)
+            return true
+        }
+    }
+
     func snapshot(limit: Int) -> [ExploreEvent] {
         lock.withLock {
             let n = min(Swift.max(0, limit), events.count)

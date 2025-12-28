@@ -12,6 +12,11 @@ struct ProxyParams {
     uint levelCount;
     uint weightCount;
     uint includeNeighborCorr;
+    uint includeAlphaFeature;
+    uint includeLogEnergyFeatures;
+    uint includeEnergies;
+    uint includeShapeFeatures;
+    uint ratioCount;
     float bias;
     float eps;
 };
@@ -81,29 +86,40 @@ kernel void pyramid_proxy(
         return;
     }
 
+    bool includeNeighbor = params.includeNeighborCorr != 0u;
+    bool includeAlpha = params.includeAlphaFeature != 0u;
+    bool includeLogEnergies = params.includeLogEnergyFeatures != 0u;
+    bool includeEnergies = params.includeEnergies != 0u;
+    bool includeShape = params.includeShapeFeatures != 0u;
+    uint ratioCount = min(params.ratioCount, (levelCount > 0u ? (levelCount - 1u) : 0u));
     uint shapeCount = 0;
     uint shapeA = 0;
     uint shapeB = 0;
-    if (levelCount <= 2) {
-        shapeCount = levelCount;
-        shapeA = 0;
-        shapeB = 1;
-    } else {
-        uint mid = (levelCount - 1u) / 2u;
-        uint first = (mid > 0) ? (mid - 1u) : 0u;
-        uint second = min(levelCount - 1u, mid);
-        if (first == second) {
-            shapeCount = 1;
-            shapeA = first;
+    if (includeShape) {
+        if (levelCount <= 2) {
+            shapeCount = levelCount;
+            shapeA = 0;
+            shapeB = 1;
         } else {
-            shapeCount = 2;
-            shapeA = first;
-            shapeB = second;
+            uint mid = (levelCount - 1u) / 2u;
+            uint first = (mid > 0) ? (mid - 1u) : 0u;
+            uint second = min(levelCount - 1u, mid);
+            if (first == second) {
+                shapeCount = 1;
+                shapeA = first;
+            } else {
+                shapeCount = 2;
+                shapeA = first;
+                shapeB = second;
+            }
         }
     }
-
-    bool includeNeighbor = params.includeNeighborCorr != 0u;
-    uint expectedWeights = levelCount + (levelCount > 0 ? (levelCount - 1u) : 0u) + (shapeCount * 2u) + (includeNeighbor ? 1u : 0u);
+    uint expectedWeights = (includeEnergies ? levelCount : 0u)
+        + ratioCount
+        + (includeLogEnergies ? levelCount : 0u)
+        + (shapeCount * 2u)
+        + (includeAlpha ? 1u : 0u)
+        + (includeNeighbor ? 1u : 0u);
     if (params.weightCount < expectedWeights) {
         if (tid == 0) { scores[tgId] = params.bias; }
         return;
@@ -130,7 +146,7 @@ kernel void pyramid_proxy(
         float sumVar = 0.0f;
         float sumVar2 = 0.0f;
         float maxVar = 0.0f;
-        bool trackShape = (level == shapeA) || (shapeCount == 2u && level == shapeB);
+        bool trackShape = includeShape && ((level == shapeA) || (shapeCount == 2u && level == shapeB));
 
         threadgroup half *dst = srcIsA ? bufB : bufA;
         if (level == 0) {
@@ -319,28 +335,57 @@ kernel void pyramid_proxy(
         float score = params.bias;
         float eps = params.eps;
         uint w = 0;
-        for (uint i = 0; i < levelCount; ++i) {
-            score += weights[w++] * energies[i];
+        if (includeEnergies) {
+            for (uint i = 0; i < levelCount; ++i) {
+                score += weights[w++] * energies[i];
+            }
         }
-        if (levelCount > 1) {
-            for (uint i = 0; i < levelCount - 1u; ++i) {
+        if (ratioCount > 0u) {
+            for (uint i = 0; i < ratioCount; ++i) {
                 float denom = energies[i + 1u] + eps;
                 score += weights[w++] * (energies[i] / denom);
             }
         }
-        if (shapeCount >= 1u) {
-            score += weights[w++] * (maxes[shapeA] / (energies[shapeA] + eps));
+        if (includeLogEnergies) {
+            for (uint i = 0; i < levelCount; ++i) {
+                float logE = log(energies[i] + eps);
+                score += weights[w++] * logE;
+            }
         }
-        if (shapeCount == 2u) {
-            score += weights[w++] * (maxes[shapeB] / (energies[shapeB] + eps));
+        if (includeShape) {
+            if (shapeCount >= 1u) {
+                score += weights[w++] * (maxes[shapeA] / (energies[shapeA] + eps));
+            }
+            if (shapeCount == 2u) {
+                score += weights[w++] * (maxes[shapeB] / (energies[shapeB] + eps));
+            }
+            if (shapeCount >= 1u) {
+                float denom = energies[shapeA] * energies[shapeA] + eps;
+                score += weights[w++] * ((e2s[shapeA] / denom) - 1.0f);
+            }
+            if (shapeCount == 2u) {
+                float denom = energies[shapeB] * energies[shapeB] + eps;
+                score += weights[w++] * ((e2s[shapeB] / denom) - 1.0f);
+            }
         }
-        if (shapeCount >= 1u) {
-            float denom = energies[shapeA] * energies[shapeA] + eps;
-            score += weights[w++] * ((e2s[shapeA] / denom) - 1.0f);
-        }
-        if (shapeCount == 2u) {
-            float denom = energies[shapeB] * energies[shapeB] + eps;
-            score += weights[w++] * ((e2s[shapeB] / denom) - 1.0f);
+        if (includeAlpha) {
+            float sumX = 0.0f;
+            float sumX2 = 0.0f;
+            float sumY = 0.0f;
+            float sumXY = 0.0f;
+            for (uint i = 0; i < levelCount; ++i) {
+                float x = float(i);
+                float y = log(energies[i] + eps);
+                sumX += x;
+                sumX2 += x * x;
+                sumY += y;
+                sumXY += x * y;
+            }
+            float n = float(levelCount);
+            float denom = n * sumX2 - sumX * sumX;
+            float slope = (denom != 0.0f) ? ((n * sumXY - sumX * sumY) / denom) : 0.0f;
+            float alphaProxy = -slope;
+            score += weights[w++] * alphaProxy;
         }
         if (includeNeighbor) {
             score += weights[w++] * neighborCorrValue;
