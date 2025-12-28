@@ -70,7 +70,7 @@ enum FirstRunSetup {
             return nil
         }
 
-        maybeRunCalibration(
+        runBootstrap(
             backend: backend,
             gpuBackend: gpuBackend,
             doSubmit: doSubmit,
@@ -81,13 +81,15 @@ enum FirstRunSetup {
         return config
     }
 
-    private static func maybeRunCalibration(
+    private static func runBootstrap(
         backend: Backend,
         gpuBackend: GPUBackend,
         doSubmit: Bool,
         mpsMarginSpecified: Bool,
         emit: (ExploreEventKind, String) -> Void
     ) {
+        ensureProxyWeights(gpuBackend: gpuBackend, emit: emit)
+
         guard doSubmit, !mpsMarginSpecified else { return }
         guard backend == .mps || backend == .all else { return }
 
@@ -101,10 +103,7 @@ enum FirstRunSetup {
         }()
 
         guard !hasCalibration else { return }
-        let prompt = "No valid \(label) calibration found. Run it now? This can take several minutes."
-        guard promptYesNo(prompt, defaultValue: false) else { return }
-
-        emit(.info, "Running \(label) calibration...")
+        emit(.info, "Running \(label) calibration (first-time setup)...")
         do {
             switch gpuBackend {
             case .metal:
@@ -114,6 +113,36 @@ enum FirstRunSetup {
             }
         } catch {
             emit(.warning, "\(label) calibration failed: \(error)")
+        }
+    }
+
+    private static func ensureProxyWeights(
+        gpuBackend: GPUBackend,
+        emit: (ExploreEventKind, String) -> Void
+    ) {
+        let imageSize = 128
+        switch gpuBackend {
+        case .metal:
+            let config = ProxyConfig.metalDefault(imageSize: imageSize)
+            let featureCount = WaveletProxy.featureCount(for: imageSize, config: config)
+            let weightsURL = GobxPaths.metalProxyWeightsURL
+            if ProxyWeights.loadValid(from: weightsURL, imageSize: imageSize, featureCount: featureCount, expectedConfig: config) != nil {
+                return
+            }
+            emit(.info, "Training proxy weights (first-time setup)...")
+            do {
+                try TrainProxyCommand.run(args: [])
+            } catch {
+                emit(.warning, "Proxy training failed: \(error)")
+            }
+        case .mps:
+            let config = ProxyConfig.mpsDefault(imageSize: imageSize)
+            let featureCount = WaveletProxy.featureCount(for: imageSize, config: config)
+            let weightsURL = GobxPaths.proxyWeightsURL
+            if ProxyWeights.loadValid(from: weightsURL, imageSize: imageSize, featureCount: featureCount, expectedConfig: config) != nil {
+                return
+            }
+            emit(.warning, "No valid MPS proxy weights found; run on Metal to generate weights.")
         }
     }
 

@@ -12,6 +12,11 @@ struct ProxyConfig: Codable, Equatable {
     let includeNeighborPenalty: Bool
     let quantizeLowpassToHalf: Bool
     let includeNeighborCorrFeature: Bool
+    let includeAlphaFeature: Bool
+    let includeLogEnergyFeatures: Bool
+    let includeEnergies: Bool
+    let includeShapeFeatures: Bool
+    let maxRatioLevels: Int?
 
     private enum CodingKeys: String, CodingKey {
         case maxLevels
@@ -20,6 +25,11 @@ struct ProxyConfig: Codable, Equatable {
         case includeNeighborPenalty
         case quantizeLowpassToHalf
         case includeNeighborCorrFeature
+        case includeAlphaFeature
+        case includeLogEnergyFeatures
+        case includeEnergies
+        case includeShapeFeatures
+        case maxRatioLevels
     }
 
     init(
@@ -28,7 +38,12 @@ struct ProxyConfig: Codable, Equatable {
         useFloatAccumulation: Bool,
         includeNeighborPenalty: Bool,
         quantizeLowpassToHalf: Bool,
-        includeNeighborCorrFeature: Bool
+        includeNeighborCorrFeature: Bool,
+        includeAlphaFeature: Bool,
+        includeLogEnergyFeatures: Bool,
+        includeEnergies: Bool,
+        includeShapeFeatures: Bool,
+        maxRatioLevels: Int?
     ) {
         self.maxLevels = maxLevels
         self.normalization = normalization
@@ -36,6 +51,11 @@ struct ProxyConfig: Codable, Equatable {
         self.includeNeighborPenalty = includeNeighborPenalty
         self.quantizeLowpassToHalf = quantizeLowpassToHalf
         self.includeNeighborCorrFeature = includeNeighborCorrFeature
+        self.includeAlphaFeature = includeAlphaFeature
+        self.includeLogEnergyFeatures = includeLogEnergyFeatures
+        self.includeEnergies = includeEnergies
+        self.includeShapeFeatures = includeShapeFeatures
+        self.maxRatioLevels = maxRatioLevels
     }
 
     init(from decoder: Decoder) throws {
@@ -46,6 +66,11 @@ struct ProxyConfig: Codable, Equatable {
         includeNeighborPenalty = try container.decodeIfPresent(Bool.self, forKey: .includeNeighborPenalty) ?? true
         quantizeLowpassToHalf = try container.decodeIfPresent(Bool.self, forKey: .quantizeLowpassToHalf) ?? false
         includeNeighborCorrFeature = try container.decodeIfPresent(Bool.self, forKey: .includeNeighborCorrFeature) ?? false
+        includeAlphaFeature = try container.decodeIfPresent(Bool.self, forKey: .includeAlphaFeature) ?? false
+        includeLogEnergyFeatures = try container.decodeIfPresent(Bool.self, forKey: .includeLogEnergyFeatures) ?? false
+        includeEnergies = try container.decodeIfPresent(Bool.self, forKey: .includeEnergies) ?? true
+        includeShapeFeatures = try container.decodeIfPresent(Bool.self, forKey: .includeShapeFeatures) ?? true
+        maxRatioLevels = try container.decodeIfPresent(Int.self, forKey: .maxRatioLevels)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -56,6 +81,11 @@ struct ProxyConfig: Codable, Equatable {
         try container.encode(includeNeighborPenalty, forKey: .includeNeighborPenalty)
         try container.encode(quantizeLowpassToHalf, forKey: .quantizeLowpassToHalf)
         try container.encode(includeNeighborCorrFeature, forKey: .includeNeighborCorrFeature)
+        try container.encode(includeAlphaFeature, forKey: .includeAlphaFeature)
+        try container.encode(includeLogEnergyFeatures, forKey: .includeLogEnergyFeatures)
+        try container.encode(includeEnergies, forKey: .includeEnergies)
+        try container.encode(includeShapeFeatures, forKey: .includeShapeFeatures)
+        try container.encodeIfPresent(maxRatioLevels, forKey: .maxRatioLevels)
     }
 
     static func legacyDefault(imageSize: Int) -> ProxyConfig {
@@ -65,7 +95,12 @@ struct ProxyConfig: Codable, Equatable {
             useFloatAccumulation: false,
             includeNeighborPenalty: true,
             quantizeLowpassToHalf: false,
-            includeNeighborCorrFeature: false
+            includeNeighborCorrFeature: false,
+            includeAlphaFeature: false,
+            includeLogEnergyFeatures: false,
+            includeEnergies: true,
+            includeShapeFeatures: true,
+            maxRatioLevels: nil
         )
     }
 
@@ -82,7 +117,12 @@ struct ProxyConfig: Codable, Equatable {
             useFloatAccumulation: true,
             includeNeighborPenalty: false,
             quantizeLowpassToHalf: true,
-            includeNeighborCorrFeature: true
+            includeNeighborCorrFeature: true,
+            includeAlphaFeature: true,
+            includeLogEnergyFeatures: true,
+            includeEnergies: false,
+            includeShapeFeatures: false,
+            maxRatioLevels: 2
         )
     }
 
@@ -96,10 +136,30 @@ struct ProxyConfig: Codable, Equatable {
     }
 }
 
+struct ProxyFeatureBreakdown {
+    let energies: [Double]
+    let energyRatios: [Double]
+    let logEnergies: [Double]
+    let shapeLevels: [Int]
+    let shapeMaxOverEnergy: [Double]
+    let shapeKurtosis: [Double]
+    let alphaProxy: Double
+    let neighborCorrValue: Double
+    let featureVector: [Double]
+}
+
 struct WaveletProxy {
     let size: Int
     private var bufferA: [Float]
     private var bufferB: [Float]
+
+    private struct RawComponents {
+        let energies: [Double]
+        let maxes: [Double]
+        let e2s: [Double]
+        let shapeLevels: [Int]
+        let neighborCorrValue: Double
+    }
 
     init(size: Int = 128) {
         precondition(size > 0 && (size & (size - 1)) == 0, "size must be power-of-two")
@@ -119,7 +179,27 @@ struct WaveletProxy {
             maxLevels: config.maxLevels,
             useFloatAccumulation: config.useFloatAccumulation,
             quantizeLowpassToHalf: config.quantizeLowpassToHalf,
-            includeNeighborCorr: config.includeNeighborCorrFeature
+            includeNeighborCorr: config.includeNeighborCorrFeature,
+            includeAlpha: config.includeAlphaFeature,
+            includeLogEnergies: config.includeLogEnergyFeatures,
+            includeEnergies: config.includeEnergies,
+            includeShapeFeatures: config.includeShapeFeatures,
+            maxRatioLevels: config.maxRatioLevels
+        )
+    }
+
+    mutating func featureBreakdown(seed: UInt64, config: ProxyConfig) -> ProxyFeatureBreakdown {
+        fillNormalized(seed: seed, normalization: config.normalization)
+        return computeFeatureBreakdown(
+            maxLevels: config.maxLevels,
+            useFloatAccumulation: config.useFloatAccumulation,
+            quantizeLowpassToHalf: config.quantizeLowpassToHalf,
+            includeNeighborCorr: config.includeNeighborCorrFeature,
+            includeAlpha: config.includeAlphaFeature,
+            includeLogEnergies: config.includeLogEnergyFeatures,
+            includeEnergies: config.includeEnergies,
+            includeShapeFeatures: config.includeShapeFeatures,
+            maxRatioLevels: config.maxRatioLevels
         )
     }
 
@@ -160,7 +240,13 @@ struct WaveletProxy {
         let levels = levelCount(for: size, maxLevels: config.maxLevels)
         let shapeCount = shapeLevelIndices(levelCount: levels).count
         let neighborCount = config.includeNeighborCorrFeature ? 1 : 0
-        return levels + max(0, levels - 1) + shapeCount + shapeCount + neighborCount
+        let alphaCount = config.includeAlphaFeature ? 1 : 0
+        let logEnergyCount = config.includeLogEnergyFeatures ? levels : 0
+        let ratioLimit = max(0, config.maxRatioLevels ?? (levels - 1))
+        let ratioCount = min(max(0, levels - 1), ratioLimit)
+        let energyCount = config.includeEnergies ? levels : 0
+        let shapeFeatureCount = config.includeShapeFeatures ? shapeCount * 2 : 0
+        return energyCount + ratioCount + logEnergyCount + shapeFeatureCount + alphaCount + neighborCount
     }
 
     private mutating func fillNormalized(seed: UInt64, normalization: ProxyConfig.Normalization) {
@@ -190,19 +276,75 @@ struct WaveletProxy {
         maxLevels: Int?,
         useFloatAccumulation: Bool,
         quantizeLowpassToHalf: Bool,
-        includeNeighborCorr: Bool
+        includeNeighborCorr: Bool,
+        includeAlpha: Bool,
+        includeLogEnergies: Bool,
+        includeEnergies: Bool,
+        includeShapeFeatures: Bool,
+        maxRatioLevels: Int?
     ) -> [Double] {
+        let raw = computeRawComponents(
+            maxLevels: maxLevels,
+            useFloatAccumulation: useFloatAccumulation,
+            quantizeLowpassToHalf: quantizeLowpassToHalf,
+            includeNeighborCorr: includeNeighborCorr
+        )
+        return WaveletProxy.composeFeatureVector(
+            raw: raw,
+        includeNeighborCorr: includeNeighborCorr,
+        includeAlpha: includeAlpha,
+        includeLogEnergies: includeLogEnergies,
+        includeEnergies: includeEnergies,
+        includeShapeFeatures: includeShapeFeatures,
+        maxRatioLevels: maxRatioLevels
+        )
+    }
+
+    private mutating func computeFeatureBreakdown(
+        maxLevels: Int?,
+        useFloatAccumulation: Bool,
+        quantizeLowpassToHalf: Bool,
+        includeNeighborCorr: Bool,
+        includeAlpha: Bool,
+        includeLogEnergies: Bool,
+        includeEnergies: Bool,
+        includeShapeFeatures: Bool,
+        maxRatioLevels: Int?
+    ) -> ProxyFeatureBreakdown {
+        let raw = computeRawComponents(
+            maxLevels: maxLevels,
+            useFloatAccumulation: useFloatAccumulation,
+            quantizeLowpassToHalf: quantizeLowpassToHalf,
+            includeNeighborCorr: includeNeighborCorr
+        )
+        return WaveletProxy.composeFeatureBreakdown(
+            raw: raw,
+            includeNeighborCorr: includeNeighborCorr,
+            includeAlpha: includeAlpha,
+            includeLogEnergies: includeLogEnergies,
+            includeEnergies: includeEnergies,
+            includeShapeFeatures: includeShapeFeatures,
+            maxRatioLevels: maxRatioLevels
+        )
+    }
+
+    private mutating func computeRawComponents(
+        maxLevels: Int?,
+        useFloatAccumulation: Bool,
+        quantizeLowpassToHalf: Bool,
+        includeNeighborCorr: Bool
+    ) -> RawComponents {
         let levels = WaveletProxy.levelCount(for: size, maxLevels: maxLevels)
         let shapeLevels = WaveletProxy.shapeLevelIndices(levelCount: levels)
         if useFloatAccumulation {
-            return computeFeatureVectorFloat(
+            return computeRawComponentsFloat(
                 levels: levels,
                 shapeLevels: shapeLevels,
                 quantizeLowpassToHalf: quantizeLowpassToHalf,
                 includeNeighborCorr: includeNeighborCorr
             )
         }
-        return computeFeatureVectorDouble(
+        return computeRawComponentsDouble(
             levels: levels,
             shapeLevels: shapeLevels,
             quantizeLowpassToHalf: quantizeLowpassToHalf,
@@ -210,12 +352,12 @@ struct WaveletProxy {
         )
     }
 
-    private mutating func computeFeatureVectorDouble(
+    private mutating func computeRawComponentsDouble(
         levels: Int,
         shapeLevels: [Int],
         quantizeLowpassToHalf: Bool,
         includeNeighborCorr: Bool
-    ) -> [Double] {
+    ) -> RawComponents {
         let shapeSet = Set(shapeLevels)
         var energies = [Double](repeating: 0, count: levels)
         var maxes = [Double](repeating: 0, count: levels)
@@ -283,22 +425,21 @@ struct WaveletProxy {
             }
         }
 
-        return WaveletProxy.composeFeatureVector(
+        return RawComponents(
             energies: energies,
             maxes: maxes,
             e2s: e2s,
             shapeLevels: shapeLevels,
-            neighborCorr: neighborCorr,
-            includeNeighborCorr: includeNeighborCorr
+            neighborCorrValue: neighborCorr ?? 0.0
         )
     }
 
-    private mutating func computeFeatureVectorFloat(
+    private mutating func computeRawComponentsFloat(
         levels: Int,
         shapeLevels: [Int],
         quantizeLowpassToHalf: Bool,
         includeNeighborCorr: Bool
-    ) -> [Double] {
+    ) -> RawComponents {
         let shapeSet = Set(shapeLevels)
         var energies = [Double](repeating: 0, count: levels)
         var maxes = [Double](repeating: 0, count: levels)
@@ -365,49 +506,164 @@ struct WaveletProxy {
             }
         }
 
-        return WaveletProxy.composeFeatureVector(
+        return RawComponents(
             energies: energies,
             maxes: maxes,
             e2s: e2s,
             shapeLevels: shapeLevels,
-            neighborCorr: neighborCorr,
-            includeNeighborCorr: includeNeighborCorr
+            neighborCorrValue: neighborCorr ?? 0.0
         )
     }
 
-    // Feature order: E_k, R_k=E_k/E_{k+1}, peak_k at shape levels, cv2_k at shape levels.
+    // Feature order: optional E_k, limited R_k=E_k/E_{k+1}, log(E_k), optional shape peak/cv2, alpha proxy, neighbor corr.
     private static func composeFeatureVector(
-        energies: [Double],
-        maxes: [Double],
-        e2s: [Double],
-        shapeLevels: [Int],
-        neighborCorr: Double?,
-        includeNeighborCorr: Bool
+        raw: RawComponents,
+        includeNeighborCorr: Bool,
+        includeAlpha: Bool,
+        includeLogEnergies: Bool,
+        includeEnergies: Bool,
+        includeShapeFeatures: Bool,
+        maxRatioLevels: Int?
     ) -> [Double] {
+        let energies = raw.energies
+        let maxes = raw.maxes
+        let e2s = raw.e2s
+        let shapeLevels = raw.shapeLevels
         let levels = energies.count
         let eps = ScoringConstants.eps
-        let totalCount = levels + max(0, levels - 1) + shapeLevels.count + shapeLevels.count + (includeNeighborCorr ? 1 : 0)
+        let ratioLimit = max(0, maxRatioLevels ?? (levels - 1))
+        let ratioCount = min(max(0, levels - 1), ratioLimit)
+        let energyCount = includeEnergies ? levels : 0
         var features: [Double] = []
-        features.reserveCapacity(totalCount)
+        features.reserveCapacity(energyCount + ratioCount + (includeLogEnergies ? levels : 0)
+            + (includeShapeFeatures ? (shapeLevels.count * 2) : 0)
+            + (includeAlpha ? 1 : 0)
+            + (includeNeighborCorr ? 1 : 0)
+        )
 
-        for v in energies { features.append(v) }
-        if levels > 1 {
-            for i in 0..<(levels - 1) {
+        if includeEnergies {
+            for v in energies { features.append(v) }
+        }
+        if ratioCount > 0 {
+            for i in 0..<ratioCount {
                 features.append(energies[i] / (energies[i + 1] + eps))
             }
         }
-        for idx in shapeLevels {
-            features.append(maxes[idx] / (energies[idx] + eps))
+        let logEnergies: [Double]? = (includeLogEnergies || includeAlpha) ? energies.map { log($0 + eps) } : nil
+        if includeLogEnergies, let logEnergies {
+            features.append(contentsOf: logEnergies)
         }
-        for idx in shapeLevels {
-            let denom = energies[idx] * energies[idx] + eps
-            features.append((e2s[idx] / denom) - 1.0)
+        if includeShapeFeatures {
+            for idx in shapeLevels {
+                features.append(maxes[idx] / (energies[idx] + eps))
+            }
+            for idx in shapeLevels {
+                let denom = energies[idx] * energies[idx] + eps
+                features.append((e2s[idx] / denom) - 1.0)
+            }
+        }
+        if includeAlpha {
+            features.append(alphaProxy(logEnergies: logEnergies ?? energies.map { log($0 + eps) }))
         }
         if includeNeighborCorr {
-            features.append(neighborCorr ?? 0.0)
+            features.append(raw.neighborCorrValue)
         }
 
         return features
+    }
+
+    private static func composeFeatureBreakdown(
+        raw: RawComponents,
+        includeNeighborCorr: Bool,
+        includeAlpha: Bool,
+        includeLogEnergies: Bool,
+        includeEnergies: Bool,
+        includeShapeFeatures: Bool,
+        maxRatioLevels: Int?
+    ) -> ProxyFeatureBreakdown {
+        let energies = raw.energies
+        let levels = energies.count
+        let eps = ScoringConstants.eps
+        var energyRatios: [Double] = []
+        if levels > 1 {
+            energyRatios.reserveCapacity(levels - 1)
+            for i in 0..<(levels - 1) {
+                energyRatios.append(energies[i] / (energies[i + 1] + eps))
+            }
+        }
+        let logEnergies = energies.map { log($0 + eps) }
+        let shapeLevels = raw.shapeLevels
+        let shapeMaxOverEnergy = shapeLevels.map { raw.maxes[$0] / (energies[$0] + eps) }
+        let shapeKurtosis = shapeLevels.map { idx -> Double in
+            let denom = energies[idx] * energies[idx] + eps
+            return (raw.e2s[idx] / denom) - 1.0
+        }
+        let alpha = alphaProxy(logEnergies: logEnergies)
+        let neighborCorrValue = includeNeighborCorr ? raw.neighborCorrValue : 0.0
+        let ratioLimit = max(0, maxRatioLevels ?? (levels - 1))
+        let ratioCount = min(max(0, levels - 1), ratioLimit)
+
+        var features: [Double] = []
+        let totalCount = (includeEnergies ? levels : 0)
+            + ratioCount
+            + (includeLogEnergies ? levels : 0)
+            + (includeShapeFeatures ? (shapeLevels.count * 2) : 0)
+            + (includeAlpha ? 1 : 0)
+            + (includeNeighborCorr ? 1 : 0)
+        features.reserveCapacity(totalCount)
+        if includeEnergies {
+            features.append(contentsOf: energies)
+        }
+        if ratioCount > 0 {
+            features.append(contentsOf: energyRatios.prefix(ratioCount))
+        }
+        if includeLogEnergies {
+            features.append(contentsOf: logEnergies)
+        }
+        if includeShapeFeatures {
+            features.append(contentsOf: shapeMaxOverEnergy)
+            features.append(contentsOf: shapeKurtosis)
+        }
+        if includeAlpha {
+            features.append(alpha)
+        }
+        if includeNeighborCorr {
+            features.append(neighborCorrValue)
+        }
+
+        return ProxyFeatureBreakdown(
+            energies: energies,
+            energyRatios: energyRatios,
+            logEnergies: logEnergies,
+            shapeLevels: shapeLevels,
+            shapeMaxOverEnergy: shapeMaxOverEnergy,
+            shapeKurtosis: shapeKurtosis,
+            alphaProxy: alpha,
+            neighborCorrValue: neighborCorrValue,
+            featureVector: features
+        )
+    }
+
+    private static func alphaProxy(logEnergies: [Double]) -> Double {
+        let n = logEnergies.count
+        guard n >= 2 else { return 0.0 }
+        var sumX: Double = 0
+        var sumX2: Double = 0
+        var sumY: Double = 0
+        var sumXY: Double = 0
+        for i in 0..<n {
+            let x = Double(i)
+            let y = logEnergies[i]
+            sumX += x
+            sumX2 += x * x
+            sumY += y
+            sumXY += x * y
+        }
+        let nD = Double(n)
+        let denom = nD * sumX2 - sumX * sumX
+        guard denom != 0 else { return 0.0 }
+        let slope = (nD * sumXY - sumX * sumY) / denom
+        return -slope
     }
 
     @inline(__always)
@@ -490,12 +746,16 @@ struct ProxyWeights: Codable {
     let imageSize: Int
     let featureCount: Int
     let config: ProxyConfig?
+    let objective: String?
+    let quantile: Double?
+    let scoreShift: Double?
+    let scoreShiftQuantile: Double?
     let bias: Double
     let weights: [Double]
 
     func predict(features: [Double]) -> Double {
         let n = min(features.count, weights.count)
-        var out = bias
+        var out = bias + (scoreShift ?? 0.0)
         if n > 0 {
             for i in 0..<n {
                 out += weights[i] * features[i]
@@ -512,7 +772,7 @@ struct ProxyWeights: Codable {
                 out[i] = Float(weights[i])
             }
         }
-        return (Float(bias), out)
+        return (Float(bias + (scoreShift ?? 0.0)), out)
     }
 
     static func defaultWeights(imageSize: Int, featureCount: Int, config: ProxyConfig) -> ProxyWeights {
@@ -522,6 +782,10 @@ struct ProxyWeights: Codable {
             imageSize: imageSize,
             featureCount: featureCount,
             config: config,
+            objective: nil,
+            quantile: nil,
+            scoreShift: nil,
+            scoreShiftQuantile: nil,
             bias: 0,
             weights: [Double](repeating: 0, count: featureCount)
         )

@@ -77,30 +77,6 @@ extension ExploreOptions {
                 o.startSeed = try parseSeed(try parser.requireValue(for: "--start"))
                 o.stateReset = true
                 o.seedMode = .state
-            case "--threads":
-                o.threads = try parser.requireInt(for: "--threads")
-            case "--batch":
-                o.batch = try parser.requireInt(for: "--batch")
-                o.batchSpecified = true
-            case "--backend":
-                o.backend = try parser.requireEnum(for: "--backend", Backend.self)
-                o.backendSpecified = true
-            case "--gpu-backend":
-                o.gpuBackend = try parser.requireEnum(for: "--gpu-backend", GPUBackend.self)
-                o.gpuBackendSpecified = true
-            case "--top":
-                o.topN = try parser.requireInt(for: "--top")
-            case "--submit":
-                o.doSubmit = true
-                o.doSubmitSpecified = true
-            case "--top-unique-users":
-                o.topUniqueUsers = true
-                o.topUniqueUsersSpecified = true
-            case "--min-score":
-                o.minScore = try parser.requireDouble(for: "--min-score")
-                o.minScoreSpecified = true
-            case "--refresh-every":
-                o.refreshEverySec = try parser.requireDouble(for: "--refresh-every")
             case "--report-every":
                 o.reportEverySec = try parser.requireDouble(for: "--report-every")
             case "--ui":
@@ -109,64 +85,6 @@ extension ExploreOptions {
                 o.uiEnabled = false
             case "--setup":
                 o.setupConfig = true
-            case "--stats":
-                o.statsEnabled = true
-            case "--no-stats":
-                o.statsEnabled = false
-            case "--stats-url":
-                o.statsUrl = try parser.requireValue(for: "--stats-url")
-            case "--mem-guard-gb":
-                o.memGuardMaxGB = max(0.0, try parser.requireDouble(for: "--mem-guard-gb"))
-                o.memGuardMaxGBSpecified = true
-            case "--mem-guard-frac":
-                o.memGuardMaxFrac = max(0.0, try parser.requireDouble(for: "--mem-guard-frac"))
-                o.memGuardMaxFracSpecified = true
-            case "--mem-guard-every":
-                o.memGuardEverySec = max(0.25, try parser.requireDouble(for: "--mem-guard-every"))
-            case "--seed-mode":
-                o.seedMode = try parser.requireEnum(for: "--seed-mode", SeedMode.self)
-            case "--state":
-                o.statePath = try parser.requireValue(for: "--state")
-                o.seedMode = .state
-            case "--state-reset":
-                o.stateReset = true
-                o.seedMode = .state
-            case "--state-write-every":
-                o.stateWriteEverySec = try parser.requireDouble(for: "--state-write-every")
-            case "--claim":
-                o.claimSize = max(256, try parser.requireInt(for: "--claim"))
-            case "--mps-margin":
-                o.mpsVerifyMargin = try parser.requireDouble(for: "--mps-margin")
-                o.mpsMarginSpecified = true
-            case "--mps-margin-auto":
-                o.mpsMarginAuto = true
-                o.mpsMarginAutoSpecified = true
-            case "--mps-inflight":
-                o.mpsInflight = max(1, try parser.requireInt(for: "--mps-inflight"))
-                o.mpsInflightSpecified = true
-            case "--mps-inflight-auto":
-                o.mpsInflightAuto = true
-            case "--mps-inflight-min":
-                o.mpsInflightMin = max(1, try parser.requireInt(for: "--mps-inflight-min"))
-                o.mpsInflightMinSpecified = true
-            case "--mps-inflight-max":
-                o.mpsInflightMax = max(1, try parser.requireInt(for: "--mps-inflight-max"))
-                o.mpsInflightMaxSpecified = true
-            case "--mps-workers":
-                o.mpsWorkers = try parser.requireInt(for: "--mps-workers")
-            case "--mps-reinit-every":
-                o.mpsReinitEverySec = max(0.0, try parser.requireDouble(for: "--mps-reinit-every"))
-            case "--mps-batch-auto":
-                o.mpsBatchAuto = true
-                o.mpsBatchAutoSpecified = true
-            case "--mps-batch-min":
-                o.mpsBatchMin = max(1, try parser.requireInt(for: "--mps-batch-min"))
-                o.mpsBatchMinSpecified = true
-            case "--mps-batch-max":
-                o.mpsBatchMax = max(1, try parser.requireInt(for: "--mps-batch-max"))
-                o.mpsBatchMaxSpecified = true
-            case "--mps-batch-tune-every":
-                o.mpsBatchTuneEverySec = max(0.25, try parser.requireDouble(for: "--mps-batch-tune-every"))
             default:
                 throw parser.unknown(a)
             }

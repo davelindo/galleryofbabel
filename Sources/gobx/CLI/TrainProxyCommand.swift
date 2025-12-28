@@ -3,13 +3,6 @@ import Foundation
 
 enum TrainProxyCommand {
     private struct Sample {
-        let seed: UInt64
-        let features: [Double]
-        let target: Double
-        let cpuTotal: Double
-    }
-
-    private struct FeatureSample {
         let features: [Double]
         let target: Double
     }
@@ -29,7 +22,7 @@ enum TrainProxyCommand {
             return out
         }
 
-        static func fitRidge(samples: [FeatureSample], lambda: Double) -> LinearModel {
+        static func fitRidge(samples: [Sample], lambda: Double) -> LinearModel {
             guard let first = samples.first else { return LinearModel(bias: 0, weights: []) }
             let dim = first.features.count + 1
             var xtx = [Double](repeating: 0, count: dim * dim)
@@ -103,17 +96,110 @@ enum TrainProxyCommand {
         }
     }
 
+    private struct FitStats {
+        var count: Int = 0
+        var sumError2: Double = 0
+        var sumX: Double = 0
+        var sumY: Double = 0
+        var sumX2: Double = 0
+        var sumY2: Double = 0
+        var sumXY: Double = 0
+
+        mutating func add(pred: Double, target: Double) {
+            count += 1
+            let err = pred - target
+            sumError2 += err * err
+            sumX += pred
+            sumY += target
+            sumX2 += pred * pred
+            sumY2 += target * target
+            sumXY += pred * target
+        }
+
+        func mse() -> Double {
+            guard count > 0 else { return 0 }
+            return sumError2 / Double(count)
+        }
+
+        func corr() -> Double {
+            guard count > 0 else { return 0 }
+            let n = Double(count)
+            let meanX = sumX / n
+            let meanY = sumY / n
+            let cov = (sumXY / n) - (meanX * meanY)
+            let varX = (sumX2 / n) - (meanX * meanX)
+            let varY = (sumY2 / n) - (meanY * meanY)
+            let denom = sqrt(max(0.0, varX * varY))
+            if denom == 0 { return 0 }
+            return cov / denom
+        }
+    }
+
+    private final class ProgressTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private let total: Int
+        private let reportEverySec: Double
+        private let startNs: UInt64
+        private var lastPrintNs: UInt64
+        private var processed: Int = 0
+
+        init(total: Int, reportEverySec: Double) {
+            self.total = total
+            self.reportEverySec = reportEverySec
+            self.startNs = DispatchTime.now().uptimeNanoseconds
+            self.lastPrintNs = startNs
+        }
+
+        func add(_ delta: Int) {
+            guard reportEverySec > 0, delta > 0 else { return }
+            lock.lock()
+            processed += delta
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now &- lastPrintNs >= UInt64(reportEverySec * 1e9) {
+                let dt = Double(now - startNs) / 1e9
+                let rate = Double(processed) / max(1e-9, dt)
+                print("scan \(processed)/\(total) (\(String(format: "%.0f", rate))/s)")
+                lastPrintNs = now
+            }
+            lock.unlock()
+        }
+    }
+
+    private final class SampleCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var train: [Sample]
+        private var val: [Sample]
+
+        init(trainCap: Int, valCap: Int) {
+            train = []
+            val = []
+            train.reserveCapacity(trainCap)
+            val.reserveCapacity(valCap)
+        }
+
+        func append(train localTrain: [Sample], val localVal: [Sample]) {
+            lock.lock()
+            train.append(contentsOf: localTrain)
+            val.append(contentsOf: localVal)
+            lock.unlock()
+        }
+
+        func drain() -> (train: [Sample], val: [Sample]) {
+            lock.lock()
+            let outTrain = train
+            let outVal = val
+            lock.unlock()
+            return (outTrain, outVal)
+        }
+    }
+
     static func run(args: [String]) throws {
-        let usage = "Usage: gobx train-proxy [--n <n>] [--top <n>] [--tail-mult <n>] [--ridge <lambda>] [--seed <seed>] [--out <path>] [--gpu-backend mps|metal] [--report-every <sec>] [--threads <n>]"
+        let usage = "Usage: gobx train-proxy [--n <n>] [--seed <seed>] [--out <path>] [--report-every <sec>] [--threads <n>]"
         var parser = ArgumentParser(args: args, usage: usage)
 
-        var n = 100_000
-        var topCount = 5_000
-        var tailMult = 4
-        var ridgeLambda = 1e-3
+        var n = 1_000_000
         var seedArg: UInt64? = nil
         var outPath: String? = nil
-        var gpuBackend: GPUBackend = .metal
         var reportEverySec = 1.0
         var threadsArg: Int? = nil
 
@@ -121,18 +207,10 @@ enum TrainProxyCommand {
             switch a {
             case "--n":
                 n = max(1, try parser.requireInt(for: "--n"))
-            case "--top":
-                topCount = max(0, try parser.requireInt(for: "--top"))
-            case "--tail-mult":
-                tailMult = max(1, try parser.requireInt(for: "--tail-mult"))
-            case "--ridge":
-                ridgeLambda = max(0, try parser.requireDouble(for: "--ridge"))
             case "--seed":
                 seedArg = try parseSeed(try parser.requireValue(for: "--seed"))
             case "--out":
                 outPath = try parser.requireValue(for: "--out")
-            case "--gpu-backend":
-                gpuBackend = try parser.requireEnum(for: "--gpu-backend", GPUBackend.self)
             case "--report-every":
                 reportEverySec = max(0, try parser.requireDouble(for: "--report-every"))
             case "--threads":
@@ -143,84 +221,33 @@ enum TrainProxyCommand {
         }
 
         let imageSize = 128
-        let config = ProxyConfig.defaultConfig(for: gpuBackend, imageSize: imageSize)
+        let config = ProxyConfig.metalDefault(imageSize: imageSize)
         let featureCount = WaveletProxy.featureCount(for: imageSize, config: config)
-        let defaultOutURL = (gpuBackend == .metal) ? GobxPaths.metalProxyWeightsURL : GobxPaths.proxyWeightsURL
+        let ridgeLambda = 1e-3
+        let splitMod: UInt64 = 10
+        let valTop = 500
+        let gateKeeps: [Double] = [1.0, 2.0, 5.0]
+
         let v2Min = V2SeedSpace.min
         let v2MaxExclusive = V2SeedSpace.maxExclusive
-        var seed = normalizeV2Seed(seedArg ?? UInt64.random(in: v2Min..<v2MaxExclusive))
-
-        let scorer = Scorer(size: imageSize)
-        var samples: [Sample] = []
-        samples.reserveCapacity(n)
-
-        final class ProgressTracker: @unchecked Sendable {
-            private let lock = NSLock()
-            private let total: Int
-            private let reportEverySec: Double
-            private let startNs: UInt64
-            private var lastPrintNs: UInt64
-            private var processed: Int = 0
-
-            init(total: Int, reportEverySec: Double) {
-                self.total = total
-                self.reportEverySec = reportEverySec
-                self.startNs = DispatchTime.now().uptimeNanoseconds
-                self.lastPrintNs = startNs
+        let baseSeed = normalizeV2Seed(seedArg ?? UInt64.random(in: v2Min..<v2MaxExclusive))
+        let outURL: URL = {
+            if let outPath {
+                return URL(fileURLWithPath: GobxPaths.expandPath(outPath))
             }
-
-            func add(_ delta: Int) {
-                guard reportEverySec > 0, delta > 0 else { return }
-                lock.lock()
-                processed += delta
-                let now = DispatchTime.now().uptimeNanoseconds
-                if now &- lastPrintNs >= UInt64(reportEverySec * 1e9) {
-                    let dt = Double(now - startNs) / 1e9
-                    let rate = Double(processed) / max(1e-9, dt)
-                    print("scan \(processed)/\(total) (\(String(format: "%.0f", rate))/s)")
-                    lastPrintNs = now
-                }
-                lock.unlock()
-            }
-        }
-
-        final class SampleCollector: @unchecked Sendable {
-            private let lock = NSLock()
-            private var samples: [Sample]
-
-            init(capacity: Int) {
-                self.samples = []
-                self.samples.reserveCapacity(capacity)
-            }
-
-            func append(_ local: [Sample]) {
-                lock.lock()
-                samples.append(contentsOf: local)
-                lock.unlock()
-            }
-
-            var count: Int {
-                lock.lock()
-                let c = samples.count
-                lock.unlock()
-                return c
-            }
-
-            func drain() -> [Sample] {
-                lock.lock()
-                let out = samples
-                lock.unlock()
-                return out
-            }
-        }
+            return GobxPaths.metalProxyWeightsURL
+        }()
 
         let progress = ProgressTracker(total: n, reportEverySec: reportEverySec)
-
         let available = ProcessInfo.processInfo.activeProcessorCount
         let threadCount = min(max(1, threadsArg ?? 1), max(1, min(n, available)))
+        let valCap = max(1, n / Int(splitMod))
+        let collector = SampleCollector(trainCap: n - valCap, valCap: valCap)
 
         if threadCount == 1 {
+            let scorer = Scorer(size: imageSize)
             var wavelet = WaveletProxy(size: imageSize)
+            var seed = baseSeed
             for _ in 0..<n {
                 let cpu = scorer.score(seed: seed)
                 let features = wavelet.featureVector(seed: seed, config: config)
@@ -228,17 +255,21 @@ enum TrainProxyCommand {
                     throw GobxError.usage("Wavelet features expected \(featureCount) values, got \(features.count)")
                 }
                 let target = config.includeNeighborPenalty ? (cpu.totalScore - cpu.neighborCorrPenalty) : cpu.totalScore
-                samples.append(Sample(seed: seed, features: features, target: target, cpuTotal: cpu.totalScore))
+                let sample = Sample(features: features, target: target)
+                if seed % splitMod == 0 {
+                    collector.append(train: [], val: [sample])
+                } else {
+                    collector.append(train: [sample], val: [])
+                }
                 seed = nextV2Seed(seed, by: 1)
                 progress.add(1)
             }
         } else {
-            let baseOffset = seed &- V2SeedSpace.min
             let spaceSize = V2SeedSpace.size
+            let baseOffset = baseSeed &- V2SeedSpace.min
             let chunk = (n + threadCount - 1) / threadCount
             let group = DispatchGroup()
             let progressStride = 256
-            let collector = SampleCollector(capacity: n)
 
             for t in 0..<threadCount {
                 let startIndex = t * chunk
@@ -249,8 +280,10 @@ enum TrainProxyCommand {
                 DispatchQueue.global(qos: .userInitiated).async {
                     let scorer = Scorer(size: imageSize)
                     var wavelet = WaveletProxy(size: imageSize)
-                    var local: [Sample] = []
-                    local.reserveCapacity(endIndex - startIndex)
+                    var localTrain: [Sample] = []
+                    var localVal: [Sample] = []
+                    localTrain.reserveCapacity(endIndex - startIndex)
+                    localVal.reserveCapacity(max(1, (endIndex - startIndex) / Int(splitMod)))
 
                     let seedOffset = (baseOffset &+ UInt64(startIndex)) % spaceSize
                     var seed = V2SeedSpace.min &+ seedOffset
@@ -263,7 +296,12 @@ enum TrainProxyCommand {
                             break
                         }
                         let target = config.includeNeighborPenalty ? (cpu.totalScore - cpu.neighborCorrPenalty) : cpu.totalScore
-                        local.append(Sample(seed: seed, features: features, target: target, cpuTotal: cpu.totalScore))
+                        let sample = Sample(features: features, target: target)
+                        if seed % splitMod == 0 {
+                            localVal.append(sample)
+                        } else {
+                            localTrain.append(sample)
+                        }
                         seed = nextV2Seed(seed, by: 1)
                         localProgress += 1
                         if localProgress % progressStride == 0 {
@@ -272,42 +310,43 @@ enum TrainProxyCommand {
                     }
                     let rem = localProgress % progressStride
                     if rem > 0 { progress.add(rem) }
-
-                    collector.append(local)
+                    collector.append(train: localTrain, val: localVal)
                     group.leave()
                 }
             }
 
             group.wait()
-            let collected = collector.count
-            if collected != n {
-                throw GobxError.usage("Training aborted early: collected \(collected)/\(n) samples.")
-            }
-            samples = collector.drain()
         }
 
-        let tail = samples.sorted { $0.cpuTotal > $1.cpuTotal }.prefix(min(topCount, samples.count))
-        var train: [FeatureSample] = samples.map { FeatureSample(features: $0.features, target: $0.target) }
-        if tailMult > 1 && !tail.isEmpty {
-            let tailSamples = tail.map { FeatureSample(features: $0.features, target: $0.target) }
-            for _ in 1..<tailMult {
-                train.append(contentsOf: tailSamples)
-            }
+        var (trainSamples, valSamples) = collector.drain()
+        if trainSamples.isEmpty, !valSamples.isEmpty {
+            trainSamples = valSamples
+            valSamples = []
+        }
+        if trainSamples.isEmpty {
+            throw GobxError.usage("No training samples collected.")
         }
 
-        let model = LinearModel.fitRidge(samples: train, lambda: ridgeLambda)
+        let model = LinearModel.fitRidge(samples: trainSamples, lambda: ridgeLambda)
 
-        let preds = samples.map { model.predict($0.features) }
-        let targets = samples.map { $0.target }
-        let mse = meanSquaredError(preds: preds, targets: targets)
-        let corr = pearson(preds, targets)
-
-        let outURL: URL = {
-            if let outPath {
-                return URL(fileURLWithPath: GobxPaths.expandPath(outPath))
+        var trainStats = FitStats()
+        for s in trainSamples {
+            let pred = model.predict(s.features)
+            trainStats.add(pred: pred, target: s.target)
+        }
+        var valStats = FitStats()
+        var valPreds: [Double] = []
+        var valTargets: [Double] = []
+        if !valSamples.isEmpty {
+            valPreds.reserveCapacity(valSamples.count)
+            valTargets.reserveCapacity(valSamples.count)
+            for s in valSamples {
+                let pred = model.predict(s.features)
+                valStats.add(pred: pred, target: s.target)
+                valPreds.append(pred)
+                valTargets.append(s.target)
             }
-            return defaultOutURL
-        }()
+        }
 
         let weights = ProxyWeights(
             schemaVersion: ProxyWeights.schemaVersion,
@@ -315,49 +354,60 @@ enum TrainProxyCommand {
             imageSize: imageSize,
             featureCount: featureCount,
             config: config,
+            objective: "ridge",
+            quantile: nil,
+            scoreShift: nil,
+            scoreShiftQuantile: nil,
             bias: model.bias,
             weights: model.weights
         )
         try ProxyWeights.save(weights, to: outURL)
 
-        print("train-proxy n=\(samples.count) tail=\(tail.count) tailMult=\(tailMult) ridge=\(String(format: "%.6f", ridgeLambda))")
-        print("fit mse=\(String(format: "%.6f", mse)) corr=\(String(format: "%.4f", corr)) bias=\(String(format: "%.6f", model.bias))")
+        print("train-proxy n=\(trainSamples.count + valSamples.count) train=\(trainSamples.count) val=\(valSamples.count) ridge=\(String(format: "%.6f", ridgeLambda))")
+        print("fit train mse=\(String(format: "%.6f", trainStats.mse())) corr=\(String(format: "%.4f", trainStats.corr())) bias=\(String(format: "%.6f", model.bias))")
+        if !valSamples.isEmpty {
+            print("fit val mse=\(String(format: "%.6f", valStats.mse())) corr=\(String(format: "%.4f", valStats.corr()))")
+            let recalls = recallAtKeeps(preds: valPreds, targets: valTargets, topCount: valTop, keepPercents: gateKeeps)
+            for r in recalls {
+                print("gate \(String(format: "%.2f", r.keepPercent))% recall \(String(format: "%.4f", r.recall)) hits \(r.hits)/\(valTop) thr=\(String(format: "%.4f", r.threshold))")
+            }
+        }
         print("wrote weights: \(outURL.path)")
     }
 
-    private static func meanSquaredError(preds: [Double], targets: [Double]) -> Double {
-        guard preds.count == targets.count, !preds.isEmpty else { return 0 }
-        var sum: Double = 0
-        for i in 0..<preds.count {
-            let d = preds[i] - targets[i]
-            sum += d * d
-        }
-        return sum / Double(preds.count)
+    private struct GateRecall {
+        let keepPercent: Double
+        let hits: Int
+        let recall: Double
+        let threshold: Double
     }
 
-    private static func pearson(_ xs: [Double], _ ys: [Double]) -> Double {
-        let n = min(xs.count, ys.count)
-        if n == 0 { return 0 }
-        var meanX: Double = 0
-        var meanY: Double = 0
-        for i in 0..<n {
-            meanX += xs[i]
-            meanY += ys[i]
+    private static func recallAtKeeps(
+        preds: [Double],
+        targets: [Double],
+        topCount: Int,
+        keepPercents: [Double]
+    ) -> [GateRecall] {
+        guard preds.count == targets.count, !preds.isEmpty else { return [] }
+        let n = preds.count
+        let top = min(topCount, n)
+        let cpuOrder = targets.indices.sorted { targets[$0] < targets[$1] }
+        let topSet = Set(cpuOrder.prefix(top))
+        let predOrder = preds.indices.sorted { preds[$0] < preds[$1] }
+
+        var out: [GateRecall] = []
+        out.reserveCapacity(keepPercents.count)
+        for keepPct in keepPercents {
+            let keep = max(1, Int((Double(n) * keepPct / 100.0).rounded(.up)))
+            let chosen = predOrder.prefix(keep)
+            var hits = 0
+            for idx in chosen where topSet.contains(idx) {
+                hits += 1
+            }
+            let thr = preds[chosen.last ?? predOrder[0]]
+            let recall = top > 0 ? Double(hits) / Double(top) : 0.0
+            out.append(GateRecall(keepPercent: keepPct, hits: hits, recall: recall, threshold: thr))
         }
-        meanX /= Double(n)
-        meanY /= Double(n)
-        var sumXY: Double = 0
-        var sumX2: Double = 0
-        var sumY2: Double = 0
-        for i in 0..<n {
-            let dx = xs[i] - meanX
-            let dy = ys[i] - meanY
-            sumXY += dx * dy
-            sumX2 += dx * dx
-            sumY2 += dy * dy
-        }
-        let denom = sqrt(sumX2 * sumY2)
-        if denom == 0 { return 0 }
-        return sumXY / denom
+        return out
     }
 }

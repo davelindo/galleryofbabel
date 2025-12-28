@@ -112,6 +112,7 @@ final class AdaptiveMargin: @unchecked Sendable {
     private let lock = NSLock()
     private var margin: Double
     private var samples: [Double] = []
+    private var trend: Int = 0
 
     let autoEnabled: Bool
     private let minMargin: Double
@@ -154,6 +155,15 @@ final class AdaptiveMargin: @unchecked Sendable {
         return v
     }
 
+    func trendSymbol() -> String {
+        lock.lock()
+        let t = trend
+        lock.unlock()
+        if t > 0 { return "^" }
+        if t < 0 { return "v" }
+        return "-"
+    }
+
     func recordSample(mpsScore: Double, cpuScore: Double) -> Update? {
         guard autoEnabled else { return nil }
         guard mpsScore.isFinite, cpuScore.isFinite else { return nil }
@@ -187,6 +197,10 @@ final class AdaptiveMargin: @unchecked Sendable {
             lock.unlock()
             return nil
         }
+        let shiftDelta = next - old
+        if shiftDelta > 0 { trend = 1 }
+        else if shiftDelta < 0 { trend = -1 }
+        else { trend = 0 }
         margin = next
         let update = Update(oldValue: old, newValue: next, target: target, sampleCount: samples.count, quantile: quantile)
         lock.unlock()
@@ -496,6 +510,8 @@ final class SubmissionManager: @unchecked Sendable {
     private var accepted: [AcceptedSeed] = []
     private var acceptedBest: [AcceptedSeed] = []
     private let acceptedCapacity = 20
+    private var lastRateLimitSeed: UInt64? = nil
+    private var lastRateLimitMessage: String? = nil
 
     init(
         config: AppConfig,
@@ -523,6 +539,27 @@ final class SubmissionManager: @unchecked Sendable {
             events.append(kind, message)
         } else {
             printLock.withLock { print(formatLogLine(message, includeTimestamp: logTimestamps)) }
+        }
+    }
+
+    private func emitRateLimit(seed: UInt64, tag: String, delay: TimeInterval) {
+        let delayStr = String(format: "%.1f", delay)
+        let message = "Rate limited submitting seed=\(seed)\(tag), backing off \(delayStr)s"
+        if let events {
+            if lastRateLimitSeed == seed, let lastMessage = lastRateLimitMessage {
+                let updated = "\(lastMessage), \(delayStr)s"
+                if events.updateLast(kind: .warning, from: lastMessage, to: updated) {
+                    lastRateLimitMessage = updated
+                    return
+                }
+            }
+            events.append(.warning, message)
+            lastRateLimitSeed = seed
+            lastRateLimitMessage = message
+        } else {
+            emit(.warning, message)
+            lastRateLimitSeed = seed
+            lastRateLimitMessage = nil
         }
     }
 
@@ -799,15 +836,18 @@ final class SubmissionManager: @unchecked Sendable {
                     }
                     updateAcceptedBestLocked(entry)
                 }
-                let pctStr = percentile.map { String(format: " p=%.2f%%", $0 * 100.0) } ?? ""
-                emit(.accepted, "Accepted seed=\(task.seed) score=\(String(format: "%.6f", task.score)) rank=\(res.rank ?? 0)\(pctStr)\(tag)")
+                if events == nil {
+                    let pctStr = percentile.map { String(format: " p=%.2f%%", $0 * 100.0) } ?? ""
+                    let msg = "Accepted seed=\(task.seed) score=\(String(format: "%.6f", task.score)) rank=\(res.rank ?? 0)\(pctStr)\(tag)"
+                    printLock.withLock { print(formatLogLine(msg, includeTimestamp: logTimestamps)) }
+                }
                 return .completed
             }
 
             if res.isRateLimited {
                 recordRateLimited()
                 let delay = await limiter.recordRateLimit()
-                emit(.warning, "Rate limited submitting seed=\(task.seed)\(tag), backing off \(String(format: "%.1f", delay))s")
+                emitRateLimit(seed: task.seed, tag: tag, delay: delay)
                 return .requeue(delay: delay)
             }
 
@@ -973,6 +1013,7 @@ final class AdaptiveScoreShift: @unchecked Sendable {
     private var shift: Double
     private var samples: [Double] = []
     private var sum: Double = 0.0
+    private var trend: Int = 0
 
     let autoEnabled: Bool
     private let minShift: Double
@@ -1010,6 +1051,15 @@ final class AdaptiveScoreShift: @unchecked Sendable {
         let v = shift
         lock.unlock()
         return v
+    }
+
+    func trendSymbol() -> String {
+        lock.lock()
+        let t = trend
+        lock.unlock()
+        if t > 0 { return "^" }
+        if t < 0 { return "v" }
+        return "-"
     }
 
     func recordSample(mpsScore: Double, cpuScore: Double) -> Update? {
@@ -1051,6 +1101,10 @@ final class AdaptiveScoreShift: @unchecked Sendable {
             lock.unlock()
             return nil
         }
+        let shiftDelta = next - old
+        if shiftDelta > 0 { trend = 1 }
+        else if shiftDelta < 0 { trend = -1 }
+        else { trend = 0 }
         shift = next
         lock.unlock()
 
@@ -1092,10 +1146,15 @@ final class ThrottledAdjustmentLog: @unchecked Sendable {
         }
 
         let net = lastValue - startValue
-        let msg = String(
-            format: "%.6f -> %.6f (Δ=%+.6f updates=%d target=%.6f %@)",
-            startValue, lastValue, net, updateCount, lastTarget, lastMeta
-        )
+        let trend: String
+        if net > 0 {
+            trend = "^"
+        } else if net < 0 {
+            trend = "v"
+        } else {
+            trend = "-"
+        }
+        let msg = String(format: "%@ %.6f", trend, lastValue)
         startValue = lastValue
         updateCount = 0
         lastEmit = now
@@ -1190,8 +1249,6 @@ final class CandidateVerifier: @unchecked Sendable {
     private let stats: ExploreStats
     private let margin: AdaptiveMargin?
     private let scoreShift: AdaptiveScoreShift?
-    private let marginLog = ThrottledAdjustmentLog(interval: 60.0)
-    private let shiftLog = ThrottledAdjustmentLog(interval: 60.0)
     private let taskQueue: VerifyQueue
     private let workerGroup = DispatchGroup()
     private let workerCount: Int
@@ -1292,30 +1349,10 @@ final class CandidateVerifier: @unchecked Sendable {
         }
 
         if let margin, let mpsScore = task.mpsScore {
-            if let update = margin.recordSample(mpsScore: Double(mpsScore), cpuScore: exact) {
-                let meta = String(format: "q=%.3f n=%d", update.quantile, update.sampleCount)
-                if let summary = marginLog.record(oldValue: update.oldValue, newValue: update.newValue, target: update.target, meta: meta) {
-                    let msg = "Adaptive mps-margin: \(summary)"
-                    if let events {
-                        events.append(.info, msg)
-                    } else {
-                        printLock.withLock { print(formatLogLine(msg, includeTimestamp: logTimestamps)) }
-                    }
-                }
-            }
+            _ = margin.recordSample(mpsScore: Double(mpsScore), cpuScore: exact)
         }
         if let scoreShift, let mpsScoreRaw = task.mpsScoreRaw {
-            if let update = scoreShift.recordSample(mpsScore: Double(mpsScoreRaw), cpuScore: exact) {
-                let meta = String(format: "meanΔ=%.6f n=%d", update.meanDelta, update.sampleCount)
-                if let summary = shiftLog.record(oldValue: update.oldValue, newValue: update.newValue, target: update.target, meta: meta) {
-                    let msg = "Adaptive mps-shift: \(summary)"
-                    if let events {
-                        events.append(.info, msg)
-                    } else {
-                        printLock.withLock { print(formatLogLine(msg, includeTimestamp: logTimestamps)) }
-                    }
-                }
-            }
+            _ = scoreShift.recordSample(mpsScore: Double(mpsScoreRaw), cpuScore: exact)
         }
 
         submission?.maybeEnqueueSubmission(seed: task.seed, score: exact, source: task.source)

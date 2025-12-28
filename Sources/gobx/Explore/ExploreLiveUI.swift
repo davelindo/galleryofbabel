@@ -168,10 +168,12 @@ final class ExploreLiveUI: @unchecked Sendable {
         }
         if (ctx.backend == .mps || ctx.backend == .all) && (margin > 0 || shift > 0) {
             if margin > 0 {
-                thrLine += "  mps-margin=\(fmt(margin))"
+                let trend = ctx.mpsVerifyMargin.trendSymbol()
+                thrLine += "  mps-margin=\(fmt(margin))\(trend)"
             }
             if shift > 0 {
-                thrLine += "  mps-shift=\(fmt(shift))"
+                let trend = ctx.mpsScoreShift.trendSymbol()
+                thrLine += "  mps-shift=\(fmt(shift))\(trend)"
             }
         }
         lines.append(truncateANSI("\(ANSI.gray)\(thrLine)\(ANSI.reset)", cols: size.cols))

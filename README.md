@@ -11,7 +11,7 @@ It is a native Swift application built for Apple Silicon, using a dual-backend a
     *   **CPU (Accelerate):** Uses vDSP/LinearAlgebra for exact verification of promising candidates found by the GPU.
 *   **Adaptive Tuning**
     *   **Batch & Inflight:** Automatically adjusts batch sizes and command buffer saturation to maximize GPU utilization.
-    *   **Dynamic Margins:** Continuously tunes the GPU/CPU scoring margin to balance false positives vs false negatives.
+    *   **Dynamic Margins/Shift:** Continuously tunes the GPU/CPU scoring margin to balance false positives vs false negatives.
 *   **Resilience**
     *   **Memory Guards:** Monitors `phys_footprint` and stops before hitting macOS memory limits (Jetsam).
     *   **State Management:** Journaled progress tracking (`gobx-seed-state.json`) allows pausing and resuming without re-scanning seeds.
@@ -26,7 +26,7 @@ It is a native Swift application built for Apple Silicon, using a dual-backend a
 | 2025-12-26 | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **4,779,931 seeds/s** | ~46W | **374.1M seeds/Wh** |
 | n/a | **MacBook Pro M4 Pro (24GB)** | `Mac16,8` | Metal (GPU) | **2.04M seeds/s** | ~40W | **183.4M seeds/Wh** |
 
-*Efficiency calculated as (Seeds per Second * 3600) / Watts. Throughput depends on `mps-margin` and verification rate.*
+*Efficiency calculated as (Seeds per Second * 3600) / Watts. Throughput depends on verification rate and adaptive margin/shift.*
 
 > **Note:** Please open a PR to add your hardware and findings.
 
@@ -65,7 +65,7 @@ make build SWIFT_BUILD_FLAGS=--disable-sandbox
 
 ### 2. First Run and Setup
 
-Run the tool in exploration mode. It will detect a missing configuration and launch an interactive wizard to set up your profile and optional telemetry.
+Run the tool in exploration mode. It will detect a missing configuration and launch an interactive wizard to set up your profile and optional telemetry, then automatically train proxy weights and run calibration if needed.
 
 ```bash
 gobx explore
@@ -84,6 +84,8 @@ X handle (optional, without @):
 Share anonymized performance stats? [y/N]
 Write config to /Users/you/.config/gallery-of-babel/config.json? [Y/n]
 Wrote config to /Users/you/.config/gallery-of-babel/config.json
+Training proxy weights (first-time setup)...
+Running Metal calibration (first-time setup)...
 ```
 
 ## Configuration
@@ -118,25 +120,14 @@ gobx explore
 
 # Run for a specific number of seeds
 gobx explore --count 10000000
-
-# Force specific tuning parameters (disables auto-tuning)
-gobx explore --batch 256 --mps-inflight 2
 ```
 
 **Common Flags:**
 *   `--endless`: Explicitly run forever (default if count is omitted).
 *   `--no-ui`: Disable the dashboard (useful for logging to files).
-*   `--mem-guard-gb <n>`: Stop if memory usage exceeds N GB.
-*   `--state-reset`: Restart search from a random location in the seed space.
-
-Defaults:
-- Metal available: `--backend mps --gpu-backend metal --submit --mps-batch-auto --mps-inflight-auto --mps-margin-auto --top-unique-users`
-- Metal unavailable: `--backend cpu --submit --top-unique-users`
-
-Device tuning seeds (used only before a per-device cache exists):
-- M1/M2: batch 256, inflight 2
-- M3/M4/M5: batch 320, inflight 2
-Cached values are stored in `~/.config/gallery-of-babel/gobx-gpu-tuning.json`.
+*   `--report-every <sec>`: Status line cadence in non-UI mode.
+*   `--start <seed>`: Start from a specific seed and reset state.
+*   `--setup`: Run the interactive setup without exiting `explore`.
 
 ### Benchmarking
 Measure raw throughput without verification overhead.
@@ -153,16 +144,31 @@ gobx bench-metal --size 128 --tg 192 --batches 256,512 --seconds 10
 The Metal proxy provides an approximation of the score. Calibration scans random seeds to determine the statistical error margin between the GPU and CPU scorers, ensuring you do not miss high-scoring seeds.
 
 ```bash
-gobx calibrate-metal --scan 2000000
+gobx calibrate-metal
+gobx calibrate-metal --force
 ```
 
-*Note: `gobx explore` loads these calibration values automatically.*
+*Note: `gobx explore` loads these calibration values automatically and runs calibration on first run when needed.*
 
 ### Verification
 Check the exact score of a specific seed using the CPU reference implementation.
 
 ```bash
 gobx score 123456789
+```
+
+### Proxy Training and Logs
+Train proxy weights either from fresh CPU samples or from a `proxy-log` capture.
+
+```bash
+# Self-contained training (generates its own CPU samples)
+gobx train-proxy
+
+# Capture training data (features + CPU scores)
+gobx proxy-log --n 500000
+
+# Train from the proxy-log output
+gobx train-proxy-log
 ```
 
 ### Stats Dashboard
@@ -194,5 +200,5 @@ Candidates passing the GPU threshold are sent to the CPU for exact scoring.
 ## Troubleshooting
 
 *   **"No valid Metal calibration found"**: Run `gobx calibrate-metal`.
-*   **Jetsam / Out of Memory**: Use `--mem-guard-frac 0.8` to limit memory usage to 80% of physical RAM.
+*   **Jetsam / Out of Memory**: Reduce other GPU/CPU load and restart; gobx attempts to exit before hitting system limits.
 *   **Crashes**: The tool includes a crash reporter that prints backtraces on SIGSEGV/SIGBUS. Set `GOBX_NO_CRASH_REPORTER=1` to disable it.

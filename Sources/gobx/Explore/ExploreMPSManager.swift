@@ -374,8 +374,8 @@ final class ExploreMPSManager: @unchecked Sendable {
             let doSubmit = p.effectiveDoSubmit && p.submission != nil && p.verifier != nil
             let baseThr = doSubmit ? (p.submission?.effectiveThreshold() ?? 0.0) : 0.0
             let margin = doSubmit ? p.mpsVerifyMargin.current() : 0.0
-            let gate = Float(baseThr - margin) - scoreShift
-            let sampleGate = (doSubmit && autoMarginEnabled) ? currentSampleGate(baseThr: baseThr, margin: margin).map { $0 - Double(scoreShift) } : nil
+            let gate = Float(baseThr - margin)
+            let sampleGate = (doSubmit && autoMarginEnabled) ? currentSampleGate(baseThr: baseThr, margin: margin) : nil
             let sampleEnabled = doSubmit && autoMarginEnabled && sampleGate != nil
 
             let maxWorkers = max(1, processingWorkers)

@@ -79,33 +79,20 @@ private func hardwareHash(for key: MetalCalibrationKey) throws -> String {
 
 enum CalibrateMetal {
     static func run(args: [String]) throws {
-        let usage = "Usage: gobx calibrate-metal [--batch <n>] [--scan <n>] [--top <n>] [--quantile <q>] [--inflight <n>] [--out <path>] [--force]"
+        let usage = "Usage: gobx calibrate-metal [--force]"
         var parser = ArgumentParser(args: args, usage: usage)
 
-        var batch = 64
-        var scanCount = 2_000_000
-        var topCount = 4096
-        var quantile = 0.999
-        var inflight = 2
+        let batch = 64
+        let scanCount = 2_000_000
+        let topCount = 4096
+        let quantile = 0.999
+        let inflight = 2
         var force = false
-        var outPath: String? = nil
 
         while let a = parser.pop() {
             switch a {
-            case "--batch":
-                batch = max(1, try parser.requireInt(for: "--batch"))
-            case "--scan":
-                scanCount = max(batch, try parser.requireInt(for: "--scan"))
-            case "--top":
-                topCount = max(256, try parser.requireInt(for: "--top"))
-            case "--quantile":
-                quantile = min(1.0, max(0.5, try parser.requireDouble(for: "--quantile")))
-            case "--inflight":
-                inflight = max(1, try parser.requireInt(for: "--inflight"))
             case "--force":
                 force = true
-            case "--out":
-                outPath = try parser.requireValue(for: "--out")
             default:
                 throw parser.unknown(a)
             }
@@ -114,12 +101,7 @@ enum CalibrateMetal {
         let key = try currentMetalCalibrationKey()
         let hash = try hardwareHash(for: key)
 
-        let url: URL = {
-            if let outPath {
-                return URL(fileURLWithPath: GobxPaths.expandPath(outPath))
-            }
-            return defaultMetalCalibrationURL()
-        }()
+        let url = defaultMetalCalibrationURL()
 
         if !force, let existing = loadMetalCalibration(from: url), existing.key == key, existing.hardwareHash == hash {
             print("Loaded existing Metal calibration: margin=\(String(format: "%.6f", existing.recommendedMargin)) q=\(String(format: "%.4f", existing.quantile)) verified=\(existing.verifiedCount) hash=\(existing.hardwareHash.prefix(12)) file=\(url.path)")
