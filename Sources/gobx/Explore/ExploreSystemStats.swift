@@ -1,5 +1,6 @@
 import Dispatch
 import Foundation
+import IOKit
 import Metal
 
 public final class ExploreSystemStats: @unchecked Sendable {
@@ -11,6 +12,7 @@ public final class ExploreSystemStats: @unchecked Sendable {
         public let gpuUtilPercent: Double?
         public let gpuPowerWatts: Double?
         public let gpuUtilAvailable: Bool
+        public let power: SystemPowerSnapshot
 
         public init(
             processResidentBytes: UInt64?,
@@ -19,7 +21,8 @@ public final class ExploreSystemStats: @unchecked Sendable {
             gpuWorkingSetBytes: UInt64?,
             gpuUtilPercent: Double?,
             gpuPowerWatts: Double?,
-            gpuUtilAvailable: Bool
+            gpuUtilAvailable: Bool,
+            power: SystemPowerSnapshot = .empty
         ) {
             self.processResidentBytes = processResidentBytes
             self.processFootprintBytes = processFootprintBytes
@@ -28,11 +31,13 @@ public final class ExploreSystemStats: @unchecked Sendable {
             self.gpuUtilPercent = gpuUtilPercent
             self.gpuPowerWatts = gpuPowerWatts
             self.gpuUtilAvailable = gpuUtilAvailable
+            self.power = power
         }
     }
 
     private let gpuDevice: MTLDevice?
     private let gpuUtilMonitor: GPUUtilMonitor?
+    private let systemPower = SystemPowerReader()
     private var started = false
 
     public init(enableGpuUtil: Bool = true) {
@@ -64,6 +69,7 @@ public final class ExploreSystemStats: @unchecked Sendable {
         let gpuAllocatedBytes = gpuAllocated.map { UInt64($0) }
         let gpuWorkingSetBytes = gpuWorkingSet.map { UInt64($0) }
         let gpuUtil = gpuUtilMonitor?.snapshot()
+        let power = systemPower.snapshot()
         return Snapshot(
             processResidentBytes: mem?.residentBytes,
             processFootprintBytes: mem?.physFootprintBytes,
@@ -71,7 +77,8 @@ public final class ExploreSystemStats: @unchecked Sendable {
             gpuWorkingSetBytes: gpuWorkingSetBytes,
             gpuUtilPercent: gpuUtil?.value,
             gpuPowerWatts: gpuUtil?.powerWatts,
-            gpuUtilAvailable: gpuUtil?.available ?? false
+            gpuUtilAvailable: gpuUtil?.available ?? false,
+            power: power
         )
     }
 }
@@ -83,6 +90,12 @@ private final class GPUUtilMonitor: @unchecked Sendable {
         let available: Bool
     }
 
+    private struct GPUSample {
+        let utilPercent: Double?
+        let powerWatts: Double?
+        let usable: Bool
+    }
+
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "gobx.gpuutil", qos: .utility)
     private var timer: DispatchSourceTimer?
@@ -90,17 +103,23 @@ private final class GPUUtilMonitor: @unchecked Sendable {
     private var latestPowerWatts: Double? = nil
     private var available: Bool
     private var isSampling = false
+    private var powermetricsAvailable: Bool
+    private var consecutiveFailures = 0
+    private var lastSampleTime: TimeInterval? = nil
 
     private let intervalSec: Double
     private let sampleDurationSec: Double
     private let sampleIntervalMs: Int
+    private let ioReader = IOGPUUtilReader()
 
     init(intervalSec: Double = 5.0, sampleDurationSec: Double = 1.0, sampleIntervalMs: Int = 250) {
         self.intervalSec = max(1.0, intervalSec)
         self.sampleDurationSec = max(0.2, sampleDurationSec)
         self.sampleIntervalMs = max(100, sampleIntervalMs)
         let exe = "/usr/bin/powermetrics"
-        self.available = FileManager.default.isExecutableFile(atPath: exe)
+        let powermetricsAvailable = FileManager.default.isExecutableFile(atPath: exe)
+        self.powermetricsAvailable = powermetricsAvailable
+        self.available = powermetricsAvailable || ioReader.isAvailable
     }
 
     var isAvailable: Bool {
@@ -108,7 +127,6 @@ private final class GPUUtilMonitor: @unchecked Sendable {
     }
 
     func start() {
-        guard isAvailable else { return }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: intervalSec, leeway: .milliseconds(100))
         t.setEventHandler { [weak self] in
@@ -133,36 +151,57 @@ private final class GPUUtilMonitor: @unchecked Sendable {
 
     private func sampleOnce() {
         lock.lock()
-        if isSampling || !available {
+        if isSampling {
             lock.unlock()
             return
         }
         isSampling = true
         lock.unlock()
 
-        let stats = Self.sampleGPUStats(durationSec: sampleDurationSec, intervalMs: sampleIntervalMs)
+        let now = Date().timeIntervalSinceReferenceDate
+        var util: Double? = nil
+        var power: Double? = nil
+        if powermetricsAvailable {
+            let stats = Self.sampleGPUStats(durationSec: sampleDurationSec, intervalMs: sampleIntervalMs)
+            util = stats.utilPercent
+            power = stats.powerWatts
+            if !stats.usable {
+                powermetricsAvailable = false
+            }
+        }
+        if util == nil {
+            util = ioReader.readUtilPercent()
+        }
 
         lock.lock()
-        if let value = stats.utilPercent {
+        if let value = util {
             latestValue = value
         }
-        if let watts = stats.powerWatts {
+        if let watts = power {
             latestPowerWatts = watts
         }
-        if stats.utilPercent == nil && stats.powerWatts == nil {
-            available = false
+        if util != nil || power != nil {
+            consecutiveFailures = 0
+            lastSampleTime = now
+        } else {
+            consecutiveFailures += 1
+        }
+        let ioAvailable = util != nil || ioReader.isAvailable
+        let recentlyAvailable = lastSampleTime.map { now - $0 < intervalSec * 6 } ?? false
+        available = powermetricsAvailable || ioAvailable || recentlyAvailable
+        if consecutiveFailures >= 3 && !powermetricsAvailable && !ioAvailable && !recentlyAvailable {
             latestValue = nil
             latestPowerWatts = nil
-            timer?.cancel()
-            timer = nil
         }
         isSampling = false
         lock.unlock()
     }
 
-    private static func sampleGPUStats(durationSec: Double, intervalMs: Int) -> (utilPercent: Double?, powerWatts: Double?) {
+    private static func sampleGPUStats(durationSec: Double, intervalMs: Int) -> GPUSample {
         let exe = "/usr/bin/powermetrics"
-        guard FileManager.default.isExecutableFile(atPath: exe) else { return (nil, nil) }
+        guard FileManager.default.isExecutableFile(atPath: exe) else {
+            return GPUSample(utilPercent: nil, powerWatts: nil, usable: false)
+        }
 
         let sampleCount = max(1, Int(ceil(durationSec * 1000.0 / Double(intervalMs))))
         let proc = Process()
@@ -177,7 +216,7 @@ private final class GPUUtilMonitor: @unchecked Sendable {
         do {
             try proc.run()
         } catch {
-            return (nil, nil)
+            return GPUSample(utilPercent: nil, powerWatts: nil, usable: false)
         }
 
         proc.waitUntilExit()
@@ -187,12 +226,14 @@ private final class GPUUtilMonitor: @unchecked Sendable {
         let outStr = String(data: outData, encoding: .utf8) ?? ""
         let errStr = String(data: errData, encoding: .utf8) ?? ""
         let output = outStr + "\n" + errStr
+        let exitOk = proc.terminationStatus == 0
+        let usable = exitOk && !output.lowercased().contains("requires root") && !output.lowercased().contains("permission")
 
         let samples = parseActiveResidency(from: output)
         let powerSamples = parsePowerWatts(from: output)
         let utilAvg = samples.isEmpty ? nil : samples.reduce(0.0, +) / Double(samples.count)
         let powerAvg = powerSamples.isEmpty ? nil : powerSamples.reduce(0.0, +) / Double(powerSamples.count)
-        return (utilAvg, powerAvg)
+        return GPUSample(utilPercent: utilAvg, powerWatts: powerAvg, usable: usable)
     }
 
     private static func parseActiveResidency(from output: String) -> [Double] {
@@ -272,5 +313,84 @@ private final class GPUUtilMonitor: @unchecked Sendable {
             }
         }
         return values
+    }
+}
+
+private final class IOGPUUtilReader {
+    private let serviceNames = ["IOAccelerator", "AGXAccelerator"]
+
+    var isAvailable: Bool {
+        readUtilPercent() != nil
+    }
+
+    func readUtilPercent() -> Double? {
+        for name in serviceNames {
+            if let value = readUtilPercent(serviceName: name) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private func readUtilPercent(serviceName: String) -> Double? {
+        var iterator: io_iterator_t = 0
+        let result = IOServiceGetMatchingServices(
+            kIOMainPortDefault,
+            IOServiceMatching(serviceName),
+            &iterator
+        )
+        guard result == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            defer { IOObjectRelease(service) }
+            if let value = readUtilPercent(service: service) {
+                return value
+            }
+            service = IOIteratorNext(iterator)
+        }
+        return nil
+    }
+
+    private func readUtilPercent(service: io_registry_entry_t) -> Double? {
+        var properties: Unmanaged<CFMutableDictionary>?
+        let result = IORegistryEntryCreateCFProperties(
+            service,
+            &properties,
+            kCFAllocatorDefault,
+            0
+        )
+        guard result == KERN_SUCCESS, let dict = properties?.takeRetainedValue() as NSDictionary? else {
+            return nil
+        }
+        guard let stats = dict["PerformanceStatistics"] as? NSDictionary else {
+            return nil
+        }
+        return parseStats(stats)
+    }
+
+    private func parseStats(_ stats: NSDictionary) -> Double? {
+        let keys = ["Device Utilization %", "GPU Busy", "Renderer Utilization %", "Tiler Utilization %"]
+        for key in keys {
+            if let value = stats[key], let normalized = normalize(value) {
+                return normalized
+            }
+        }
+        return nil
+    }
+
+    private func normalize(_ value: Any) -> Double? {
+        let raw = (value as? NSNumber)?.doubleValue ?? (value as? Double)
+        guard let raw, raw.isFinite else { return nil }
+        var normalized = raw
+        if raw <= 1.0 {
+            normalized = raw * 100.0
+        } else if raw > 100.0 && raw <= 1000.0 {
+            normalized = raw / 10.0
+        } else if raw > 1000.0 && raw <= 10000.0 {
+            normalized = raw / 100.0
+        }
+        return min(100.0, max(0.0, normalized))
     }
 }
