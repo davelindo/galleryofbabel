@@ -187,6 +187,8 @@ struct HistoryPoint: Identifiable {
     let gpuMemBytes: UInt64?
     let gpuUtilPercent: Double?
     let gpuPowerWatts: Double?
+    let socPowerWatts: Double?
+    let socTempC: Double?
 }
 
 @MainActor
@@ -514,7 +516,9 @@ final class ExploreMenuModel: ObservableObject {
             rssBytes: systemSnap.processResidentBytes,
             gpuMemBytes: systemSnap.gpuAllocatedBytes,
             gpuUtilPercent: systemSnap.gpuUtilPercent,
-            gpuPowerWatts: systemSnap.gpuPowerWatts
+            gpuPowerWatts: systemSnap.gpuPowerWatts,
+            socPowerWatts: systemSnap.power.systemLoadWatts,
+            socTempC: systemSnap.power.temperatureC
         )
         history.append(historyPoint)
         if history.count > historyCapacity {

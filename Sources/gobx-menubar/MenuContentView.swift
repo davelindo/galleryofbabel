@@ -10,6 +10,11 @@ struct MenuContentView: View {
     var body: some View {
         ZStack {
             VStack(spacing: 6) {
+                footerView
+
+                Divider()
+                    .opacity(0.5)
+
                 headerView
 
                 Divider()
@@ -17,13 +22,9 @@ struct MenuContentView: View {
 
                 contentContainer
                     .frame(maxHeight: .infinity)
-
-                Divider()
-                    .opacity(0.5)
-
-                footerView
             }
-            .padding(12)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .background(Color.clear)
 
@@ -36,37 +37,14 @@ struct MenuContentView: View {
     }
 
     private var headerView: some View {
-        VStack(spacing: 4) {
-            HStack {
-                Label {
-                    Text("Gobx Explore")
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                } icon: {
-                    Image(systemName: "cpu.fill")
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .foregroundStyle(AppTheme.accent)
-                }
-
-                Spacer()
-
-                StatusBadge(
-                    text: model.isPaused ? "PAUSED" : (model.isRunning ? "ACTIVE" : "IDLE"),
-                    state: model.isPaused ? .warning : (model.isRunning ? .success : .neutral)
-                )
+        HStack(spacing: 2) {
+            ForEach(MenuTab.allCases) { tab in
+                TabButton(tab: tab, selected: $model.selectedTab, namespace: animationNamespace)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 8)
-            .padding(.bottom, 0)
-
-            HStack(spacing: 2) {
-                ForEach(MenuTab.allCases) { tab in
-                    TabButton(tab: tab, selected: $model.selectedTab, namespace: animationNamespace)
-                }
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 32)
-            .padding(.bottom, 4)
         }
+        .padding(.horizontal, 8)
+        .frame(height: 32)
+        .padding(.vertical, 2)
     }
 
     @ViewBuilder
@@ -76,7 +54,7 @@ struct MenuContentView: View {
             ScrollView(showsIndicators: true) {
                 DashboardView(model: model)
                     .padding(.vertical, 4)
-                    .padding(.horizontal, 2)
+                    .padding(.horizontal, 4)
             }
             .scrollIndicatorsVisible()
             .frame(maxHeight: .infinity)
@@ -84,7 +62,7 @@ struct MenuContentView: View {
             ScrollView(showsIndicators: true) {
                 StatsView(model: model)
                     .padding(.vertical, 4)
-                    .padding(.horizontal, 2)
+                    .padding(.horizontal, 4)
             }
             .scrollIndicatorsVisible()
             .frame(maxHeight: .infinity)
@@ -108,22 +86,41 @@ struct MenuContentView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             } else {
-                Text(formatDuration(model.summary.elapsed))
-                    .font(.system(.caption, design: .monospaced))
+                HStack(spacing: 8) {
+                    Text(formatDuration(model.summary.elapsed))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 4) {
+                        Image(systemName: "cpu.fill")
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        Text("Gobx Explore")
+                            .font(.caption)
+                    }
                     .foregroundStyle(.secondary)
+                }
             }
 
             Spacer()
 
             Group {
                 if model.isRunning {
-                    ControlButton(icon: model.isPaused ? "play.fill" : "pause.fill", action: { model.togglePause() })
+                    ControlButton(
+                        icon: model.isPaused ? "play.fill" : "pause.fill",
+                        action: { model.togglePause() },
+                        activeColor: model.isPaused ? AppTheme.warn : AppTheme.ok,
+                        isActive: true
+                    )
                         .help(model.isPaused ? "Resume" : "Pause")
 
                     ControlButton(icon: "stop.fill", action: { model.stop() })
                         .help("Stop Engine")
                 } else {
-                    ControlButton(icon: "play.fill", action: { model.start() })
+                    ControlButton(
+                        icon: "play.fill",
+                        action: { model.start() },
+                        activeColor: .secondary,
+                        isActive: true
+                    )
                         .help("Start Engine")
                 }
 
@@ -148,8 +145,6 @@ struct MenuContentView: View {
 
 struct DashboardView: View {
     @ObservedObject var model: ExploreMenuModel
-    @State private var showBestSeed = false
-    @State private var closeTask: DispatchWorkItem?
 
     var body: some View {
         let rankText = model.summary.personalBestPreviousRank.map { "#\($0)" } ?? "--"
@@ -204,46 +199,49 @@ struct DashboardView: View {
 
             if model.summary.bestScore != nil || model.summary.topBestScore != nil || model.summary.personalBestPreviousScore != nil {
                 GlassCard(
-                    title: "Session Best",
+                    title: "Performance",
                     icon: "trophy.fill",
                     headerTrailing: {
                         if let top = model.summary.topBestScore {
-                            Text("Current #1: \(String(format: "%.6f", top))")
-                                .font(.system(size: 11, weight: .regular, design: .rounded))
-                                .foregroundStyle(.secondary)
+                            SeedHoverLabel(seed: model.summary.topBestSeed, source: "Leaderboard") {
+                                Text("Current #1: \(String(format: "%.6f", top))")
+                                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 ) {
                     VStack(alignment: .leading, spacing: 8) {
-                        if let best = model.summary.bestScore {
-                            HStack {
-                                Text(String(format: "%.6f", best))
-                                    .font(.system(size: 24, weight: .bold, design: .monospaced))
-                                    .contentShape(Rectangle())
-                                    .onHover { hovering in
-                                        guard model.summary.bestSeed != nil else { return }
-                                        if hovering {
-                                            cancelClose()
-                                            showBestSeed = true
-                                        } else {
-                                            scheduleClose()
+                        let best = model.summary.bestScore
+                        let previous = model.summary.personalBestPreviousScore
+
+                        if best != nil || previous != nil {
+                            HStack(alignment: .top, spacing: 16) {
+                                if let best {
+                                    SeedHoverLabel(seed: model.summary.bestSeed, source: model.summary.bestSource) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("This run")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            Text(String(format: "%.6f", best))
+                                                .font(.system(size: 24, weight: .bold, design: .monospaced))
                                         }
                                     }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                }
 
-                                Spacer()
-                            }
-                            .popover(isPresented: $showBestSeed, arrowEdge: .trailing) {
-                                if let seed = model.summary.bestSeed {
-                                    SeedHoverView(seed: seed, source: model.summary.bestSource)
-                                        .onHover { hovering in
-                                            if hovering {
-                                                cancelClose()
-                                                showBestSeed = true
-                                            } else {
-                                                scheduleClose()
-                                            }
+                                if let previous {
+                                    SeedHoverLabel(seed: model.summary.personalBestPreviousSeed, source: "All-time best") {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Personal best (all time)")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            Text(String(format: "%.6f", previous))
+                                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                                .foregroundStyle(.secondary)
                                         }
-                                        .padding(8)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
                         }
@@ -252,20 +250,6 @@ struct DashboardView: View {
                             ProgressView(value: best, total: top * 1.1)
                                 .tint(AppTheme.accent)
                                 .scaleEffect(y: 0.5)
-                        }
-
-                        if model.summary.bestScore != nil || model.summary.personalBestPreviousScore != nil {
-                            HStack {
-                                if let best = model.summary.bestScore {
-                                    Text("Personal Best (This Run): \(String(format: "%.6f", best))")
-                                }
-                                Spacer()
-                                if let previous = model.summary.personalBestPreviousScore {
-                                    Text("Personal Best (Previous): \(String(format: "%.6f", previous))")
-                                }
-                            }
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
                         }
                     }
                     .padding(16)
@@ -313,47 +297,112 @@ struct DashboardView: View {
         }
     }
 
-    private func scheduleClose() {
-        cancelClose()
-        let task = DispatchWorkItem { showBestSeed = false }
-        closeTask = task
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: task)
-    }
-
-    private func cancelClose() {
-        closeTask?.cancel()
-        closeTask = nil
-    }
 }
 
 struct StatsView: View {
     @ObservedObject var model: ExploreMenuModel
 
     var body: some View {
+        let hasSocPower = model.history.contains { $0.socPowerWatts != nil }
+        let socPowerSeries = model.history.map { $0.socPowerWatts ?? 0 }
+        let hasEfficiency = model.history.contains { ($0.socPowerWatts ?? 0) > 0 }
+        let efficiencySeries = model.history.map { point in
+            guard let power = point.socPowerWatts, power > 0 else { return 0.0 }
+            return point.totalRate / power
+        }
+        let hasTemp = model.history.contains { $0.socTempC != nil }
+        let tempSeries: [Double] = {
+            var out: [Double] = []
+            out.reserveCapacity(model.history.count)
+            var last: Double? = nil
+            for point in model.history {
+                if let value = point.socTempC {
+                    last = value
+                }
+                out.append(last ?? 0)
+            }
+            return out
+        }()
+
         VStack(spacing: 16) {
-            ChartCard(title: "Throughput (Total)", value: model.history.map { $0.totalRate }, color: AppTheme.accent)
+            ChartCard(
+                title: "Throughput (Total)",
+                value: model.history.map { $0.totalRate },
+                color: AppTheme.accent,
+                formatter: fmtRate
+            )
 
             if model.summary.backend == .mps || model.summary.backend == .all {
                 HStack(spacing: 12) {
-                    ChartCard(title: "MPS Rate", value: model.history.map { $0.mpsRate }, color: AppTheme.gpu, height: 80)
-                    ChartCard(title: "CPU Rate", value: model.history.map { $0.cpuRate }, color: AppTheme.cpu, height: 80)
+                    ChartCard(
+                        title: "MPS Rate",
+                        value: model.history.map { $0.mpsRate },
+                        color: AppTheme.gpu,
+                        height: 80,
+                        formatter: fmtRate
+                    )
+                    ChartCard(
+                        title: "CPU Rate",
+                        value: model.history.map { $0.cpuRate },
+                        color: AppTheme.cpu,
+                        height: 80,
+                        formatter: fmtRate
+                    )
                 }
+            }
+
+            if hasEfficiency {
+                ChartCard(
+                    title: "Efficiency (seeds/W)",
+                    value: efficiencySeries,
+                    color: AppTheme.ok,
+                    height: 80,
+                    formatter: fmtRate,
+                    skipZerosForStats: true
+                )
+            }
+
+            if hasSocPower {
+                ChartCard(
+                    title: "SoC Power",
+                    value: socPowerSeries,
+                    color: AppTheme.warn,
+                    height: 80,
+                    formatter: fmtWatts,
+                    skipZerosForStats: true
+                )
+            }
+
+            if hasTemp {
+                ChartCard(
+                    title: "SoC Temp",
+                    value: tempSeries,
+                    color: AppTheme.warn,
+                    height: 80,
+                    formatter: { String(format: "%.0f C", $0) },
+                    skipZerosForStats: true
+                )
             }
 
             GlassCard(title: "System Load", icon: "memorychip") {
                 VStack(spacing: 12) {
                     HStack {
-                        Gauge(value: model.summary.system.gpuUtilPercent ?? 0, in: 0...100) {
+                        let gpuUtil = model.summary.system.gpuUtilPercent
+                        Gauge(value: gpuUtil ?? 0, in: 0...100) {
                             Text("GPU Util")
                         } currentValueLabel: {
-                            Text("\(Int(model.summary.system.gpuUtilPercent ?? 0))%")
+                            Text(gpuUtil.map { "\(Int($0))%" } ?? "NA")
                         }
                         .gaugeStyle(.accessoryCircular)
-                        .tint(AppTheme.gpu)
+                        .tint(gpuUtil == nil ? .secondary : AppTheme.gpu)
 
                         Spacer()
 
                         VStack(alignment: .trailing) {
+                            if model.summary.system.power.available {
+                                SysRow(label: "SoC Power", value: fmtWatts(model.summary.system.power.systemLoadWatts))
+                                SysRow(label: "SoC Temp", value: fmtTempC(model.summary.system.power.temperatureC))
+                            }
                             SysRow(label: "GPU Mem", value: fmtBytes(model.summary.system.gpuAllocatedBytes))
                             if let watts = model.summary.system.gpuPowerWatts {
                                 SysRow(label: "GPU Power", value: String(format: "%.1f W", watts))
@@ -415,7 +464,7 @@ struct EventsListView: View {
                         color: colorForEvent(e.kind)
                     )
                     .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10))
+                    .listRowInsets(EdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6))
                 }
             }
         }
@@ -457,23 +506,19 @@ struct SubmissionsListView: View {
                 .listRowBackground(Color.clear)
             } else {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, s in
-                    LogLineView(
+                    SubmissionLineView(
                         time: s.time,
-                        message: formatSub(s),
+                        score: s.score,
+                        seed: s.seed,
                         color: colorForSub(s.kind)
                     )
                     .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10))
+                    .listRowInsets(EdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6))
                 }
             }
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-    }
-
-    func formatSub(_ s: SubmissionLogEntry) -> String {
-        let sc = s.score.isFinite ? String(format: "%.5f", s.score) : "NaN"
-        return "\(s.kind.rawValue.uppercased()) | Score: \(sc) | Seed: \(s.seed)"
     }
 
     func colorForSub(_ kind: SubmissionLogKind) -> Color {
@@ -557,7 +602,7 @@ struct SettingsView: View {
             Section {
                 Link(destination: URL(string: "https://github.com/davelindo/galleryofbabel")!) {
                     HStack(spacing: 6) {
-                        Image("github-mark", bundle: .module)
+                        githubLogoImage()
                             .renderingMode(.template)
                             .resizable()
                             .scaledToFit()
@@ -702,13 +747,41 @@ struct ChartCard: View {
     let value: [Double]
     let color: Color
     var height: CGFloat = 100
+    var formatter: (Double) -> String = { String(format: "%.2f", $0) }
+    var skipZerosForStats: Bool = false
 
     var body: some View {
-        GlassCard(title: title) {
-            Sparkline(values: value, tint: color)
-                .frame(height: height)
-                .padding(8)
+        let statsValues = filteredStatsValues()
+        let minVal = statsValues.min()
+        let maxVal = statsValues.max()
+        let latestVal = value.last ?? 0
+
+        GlassCard(title: title, headerTrailing: {
+            Text(formatter(latestVal))
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }) {
+            VStack(spacing: 6) {
+                Sparkline(values: value, tint: color)
+                    .frame(height: height)
+
+                if let minVal, let maxVal {
+                    HStack {
+                        Text("min \(formatter(minVal))")
+                        Spacer()
+                        Text("max \(formatter(maxVal))")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .padding(8)
         }
+    }
+
+    private func filteredStatsValues() -> [Double] {
+        let filtered = skipZerosForStats ? value.filter { $0 > 0 } : value
+        return filtered.isEmpty ? value : filtered
     }
 }
 
@@ -724,12 +797,16 @@ struct TabButton: View {
             ZStack {
                 if selected == tab {
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.white.opacity(0.1))
+                        .fill(AppTheme.tabSelectedFill)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(AppTheme.tabSelectedStroke, lineWidth: 1)
+                        )
                         .matchedGeometryEffect(id: "TABBG", in: namespace)
                 }
                 Image(systemName: tab.systemImage)
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundStyle(selected == tab ? .white : .secondary)
+                    .foregroundStyle(selected == tab ? AppTheme.accent : .secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -814,17 +891,70 @@ struct LogLineView: View {
             Spacer()
         }
         .padding(.vertical, 4)
-        .background(hovering ? Color.white.opacity(0.05) : Color.clear)
+        .background(hovering ? AppTheme.rowHoverFill : Color.clear)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .animation(.easeInOut(duration: 0.15), value: hovering)
     }
 
     func timeString(_ date: Date) -> String {
+        Self.timeFormatter.string(from: date)
+    }
+
+    private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
-        return f.string(from: date)
+        return f
+    }()
+}
+
+struct SubmissionLineView: View {
+    let time: Date
+    let score: Double
+    let seed: UInt64
+    let color: Color
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(timeString(time))
+                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 2)
+                .frame(width: 50, alignment: .leading)
+
+            Text(formatScore(score))
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(color)
+                .lineLimit(1)
+
+            Text("seed \(seed)")
+                .font(.system(size: 11, weight: .regular, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Spacer()
+        }
+        .padding(.vertical, 4)
+        .background(hovering ? AppTheme.rowHoverFill : Color.clear)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .animation(.easeInOut(duration: 0.15), value: hovering)
     }
+
+    private func formatScore(_ value: Double) -> String {
+        value.isFinite ? String(format: "%.5f", value) : "NaN"
+    }
+
+    private func timeString(_ date: Date) -> String {
+        Self.timeFormatter.string(from: date)
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 }
 
 struct StatusBadge: View {
@@ -860,17 +990,28 @@ struct StatusBadge: View {
 struct ControlButton: View {
     let icon: String
     let action: () -> Void
+    var activeColor: Color? = nil
+    var isActive: Bool = false
     @State private var hovering = false
 
     var body: some View {
+        let accent = activeColor ?? AppTheme.accent
+        let baseBg = hovering ? AppTheme.controlHoverFill : AppTheme.controlFill
+        let activeBg = hovering ? accent.opacity(0.35) : accent.opacity(0.22)
+        let border = isActive ? accent.opacity(0.45) : AppTheme.controlStroke
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .frame(width: 24, height: 24)
                 .contentShape(Rectangle())
+                .foregroundStyle(isActive ? accent : .primary)
         }
         .buttonStyle(.plain)
-        .background(hovering ? Color.white.opacity(0.18) : Color.white.opacity(0.1))
+        .background(isActive ? activeBg : baseBg)
+        .overlay(
+            Circle()
+                .stroke(border, lineWidth: 1)
+        )
         .clipShape(Circle())
         .onHover { hovering = $0 }
         .animation(.easeInOut(duration: 0.15), value: hovering)
@@ -922,6 +1063,60 @@ struct SeedHoverView: View {
     }
 }
 
+struct SeedHoverLabel<Content: View>: View {
+    let seed: UInt64?
+    let source: String?
+    let content: () -> Content
+    @State private var showSeed = false
+    @State private var closeTask: DispatchWorkItem?
+
+    init(seed: UInt64?, source: String?, @ViewBuilder content: @escaping () -> Content) {
+        self.seed = seed
+        self.source = source
+        self.content = content
+    }
+
+    var body: some View {
+        content()
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                guard seed != nil else { return }
+                if hovering {
+                    cancelClose()
+                    showSeed = true
+                } else {
+                    scheduleClose()
+                }
+            }
+            .popover(isPresented: $showSeed, arrowEdge: .trailing) {
+                if let seed {
+                    SeedHoverView(seed: seed, source: source)
+                        .onHover { hovering in
+                            if hovering {
+                                cancelClose()
+                                showSeed = true
+                            } else {
+                                scheduleClose()
+                            }
+                        }
+                        .padding(8)
+                }
+            }
+    }
+
+    private func scheduleClose() {
+        cancelClose()
+        let task = DispatchWorkItem { showSeed = false }
+        closeTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: task)
+    }
+
+    private func cancelClose() {
+        closeTask?.cancel()
+        closeTask = nil
+    }
+}
+
 struct EnergyRibbon: View {
     let profile: GPUThroughputProfile
 
@@ -951,15 +1146,29 @@ struct MetricInline: View {
 
     var body: some View {
         let transitionValue = animateValue ?? (Double(value) ?? 0)
+        ViewThatFits(in: .horizontal) {
+            metricRow(valueSize: 32, labelSize: 13, transitionValue: transitionValue)
+            metricRow(valueSize: 28, labelSize: 12, transitionValue: transitionValue)
+            metricRow(valueSize: 24, labelSize: 11, transitionValue: transitionValue)
+        }
+    }
+
+    private func metricRow(valueSize: CGFloat, labelSize: CGFloat, transitionValue: Double) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 4) {
             Text(value)
-                .font(.system(size: 32, weight: .medium, design: .monospaced))
+                .font(.system(size: valueSize, weight: .medium, design: .monospaced))
                 .foregroundStyle(LinearGradient(colors: [color, color.opacity(0.7)], startPoint: .topLeading, endPoint: .bottomTrailing))
                 .contentTransition(.numericText(value: transitionValue))
                 .animation(animateValue == nil ? .default : .snappy, value: transitionValue)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .allowsTightening(true)
             Text(label)
-                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .font(.system(size: labelSize, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .allowsTightening(true)
         }
     }
 }
@@ -1149,11 +1358,47 @@ private func fmtBytes(_ v: UInt64?) -> String {
     return String(format: "%.0f MB", Double(v) / 1024 / 1024)
 }
 
+private func fmtWatts(_ v: Double?) -> String {
+    guard let v else { return "-" }
+    return String(format: "%.1f W", v)
+}
+
+private func fmtTempC(_ v: Double?) -> String {
+    guard let v else { return "-" }
+    return String(format: "%.0f C", v)
+}
+
+private func githubLogoImage() -> Image {
+    if let url = Bundle.module.url(forResource: "github-mark", withExtension: "png"),
+       let image = NSImage(contentsOf: url) {
+        return Image(nsImage: image)
+    }
+    return Image(systemName: "chevron.left.slash.chevron.right")
+}
+
 struct AppTheme {
-    static let accent = Color.cyan
-    static let cpu = Color.blue
-    static let gpu = Color.orange
-    static let ok = Color.green
-    static let warn = Color.yellow
-    static let error = Color.red
+    static var accent: Color { .accentColor }
+    static var cpu: Color { Color(nsColor: .systemBlue) }
+    static var gpu: Color { dynamicColor(light: emphasizeLight(.systemOrange, amount: 0.35), dark: .systemOrange) }
+    static var ok: Color { dynamicColor(light: emphasizeLight(.systemGreen, amount: 0.35), dark: .systemGreen) }
+    static var warn: Color { dynamicColor(light: emphasizeLight(.systemYellow, amount: 0.45), dark: .systemYellow) }
+    static var error: Color { Color(nsColor: .systemRed) }
+    static var tabSelectedFill: Color { Color(nsColor: .selectedControlColor).opacity(0.2) }
+    static var tabSelectedStroke: Color { Color(nsColor: .selectedControlColor).opacity(0.45) }
+    static var controlFill: Color { Color(nsColor: .controlBackgroundColor).opacity(0.85) }
+    static var controlHoverFill: Color { Color(nsColor: .controlBackgroundColor).opacity(1.0) }
+    static var controlStroke: Color { Color(nsColor: .separatorColor).opacity(0.6) }
+    static var rowHoverFill: Color { Color(nsColor: .tertiaryLabelColor).opacity(0.2) }
+
+    private static func dynamicColor(light: NSColor, dark: NSColor) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let match = appearance.bestMatch(from: [.darkAqua, .aqua]) ?? .aqua
+            return match == .darkAqua ? dark : light
+        })
+    }
+
+    private static func emphasizeLight(_ color: NSColor, amount: CGFloat) -> NSColor {
+        let base = color.usingColorSpace(.sRGB) ?? color
+        return base.blended(withFraction: amount, of: .black) ?? base
+    }
 }
