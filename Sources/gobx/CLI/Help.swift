@@ -14,13 +14,14 @@ Usage:
   gobx proxy-log [--n <n>] [--out <path>] [--report-every <sec>] [--threads <n>] [--append]
   gobx train-proxy [--n <n>] [--seed <seed>] [--out <path>] [--report-every <sec>] [--threads <n>]
   gobx train-proxy-log [--in <path>] [--out <path>] [--report-every <sec>]
-  gobx explore [--count <n>] [--endless] [--start <seed>] [--report-every <sec>] [--ui|--no-ui] [--setup]
+  gobx explore [--count <n>] [--endless] [--start <seed>] [--report-every <sec>] [--gpu-profile dabbling|interested|lets-go|heater] [--submit|--no-submit] [--ui|--no-ui] [--setup]
 
 Notes:
   - In endless mode, prints live seeds/s + running avg score.
   - When stdout is a TTY, `explore` uses an htop-style live UI by default (disable with `--no-ui`).
   - When Metal is available, `explore` uses the Metal GPU proxy with adaptive margin/shift and CPU verification.
-  - Approximate candidates (GPU) are verified with the CPU scorer before submitting.
+  - Approximate candidates (GPU) are verified with the CPU scorer before submitting (use --no-submit to disable).
+  - Use --gpu-profile to attenuate GPU throughput on laptops.
   - Config/profile is read from `~/.config/gallery-of-babel/config.json`.
   - If no profile is configured, `explore` falls back to the default author profile for submissions.
   - When no config is found, `explore` offers an interactive first-run setup and runs the bootstrap steps automatically.

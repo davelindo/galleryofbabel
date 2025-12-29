@@ -188,6 +188,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         let minScore: Double
         let mpsVerifyMargin: AdaptiveMargin
         let mpsScoreShift: AdaptiveScoreShift
+        let gpuThroughput: GPUThroughputLimiter
 
         let effectiveDoSubmit: Bool
         let submission: SubmissionManager?
@@ -201,6 +202,7 @@ final class ExploreMPSManager: @unchecked Sendable {
         let topApproxLimit: Int
         let topApproxTracker: TopApproxTracker
         let stop: StopFlag
+        let pause: PauseFlag
 
         let scorer: any GPUScorer
         let makeScorer: (@Sendable (Int, Int) throws -> any GPUScorer)?
@@ -609,6 +611,16 @@ final class ExploreMPSManager: @unchecked Sendable {
         var lastSavedNs: UInt64 = 0
         let saveCooldownNs: UInt64 = 30_000_000_000
 
+        let throttleWindowNs: UInt64 = 250_000_000
+        let throttleRateUpdateNs: UInt64 = 500_000_000
+        let throttleRateEwma = 0.2
+        var throttleWindowStartNs = DispatchTime.now().uptimeNanoseconds
+        var throttleWindowUsed = 0
+        var throttleBlockedUntilNs: UInt64 = 0
+        var throttleRateEstimate: Double = 0.0
+        var throttleRateLastNs = throttleWindowStartNs
+        var throttleRateLastCompleted = completed
+
         func currentStep() -> (up: Double, down: Double) {
             tuneStepLevels[tuneLevel]
         }
@@ -642,6 +654,13 @@ final class ExploreMPSManager: @unchecked Sendable {
                 seeds = [UInt64](repeating: 0, count: batch)
                 pending = []
                 pending.reserveCapacity(inflight)
+                let now = DispatchTime.now().uptimeNanoseconds
+                throttleWindowStartNs = now
+                throttleWindowUsed = 0
+                throttleBlockedUntilNs = now
+                throttleRateEstimate = 0.0
+                throttleRateLastNs = now
+                throttleRateLastCompleted = completed
                 tuneWarmupRemaining = tuneWarmupIntervals
                 inflightWarmupRemaining = inflightWarmupIntervals
                 lastReinitNs = DispatchTime.now().uptimeNanoseconds
@@ -706,6 +725,12 @@ final class ExploreMPSManager: @unchecked Sendable {
             emit(.warning, "Warning: GPU run \(label) (\(error)); reinitializing with batch=\(nextBatch) inflight=\(nextInflight)")
             enqueued = completed
             pending.removeAll(keepingCapacity: true)
+            throttleWindowStartNs = now
+            throttleWindowUsed = 0
+            throttleBlockedUntilNs = now
+            throttleRateEstimate = 0.0
+            throttleRateLastNs = now
+            throttleRateLastCompleted = completed
             rebuildScorer(newBatch: nextBatch, newInflight: nextInflight, reason: "recovery")
             resetTuningState(now: now)
             return true
@@ -740,6 +765,77 @@ final class ExploreMPSManager: @unchecked Sendable {
             lastTuneCompleted = completed
             inflightLastTuneNs = now
             inflightLastCompleted = completed
+        }
+
+        func throttleEnabled(_ factor: Double) -> Bool {
+            factor.isFinite && factor > 0 && factor < 0.999
+        }
+
+        func throttleResetIfDisabled(now: UInt64) {
+            let factor = p.gpuThroughput.factor()
+            if !throttleEnabled(factor) {
+                throttleWindowStartNs = now
+                throttleWindowUsed = 0
+                throttleBlockedUntilNs = now
+                throttleRateLastNs = now
+                throttleRateLastCompleted = completed
+            }
+        }
+
+        func throttleUpdateWindow(now: UInt64) {
+            if now &- throttleWindowStartNs >= throttleWindowNs {
+                throttleWindowStartNs = now
+                throttleWindowUsed = 0
+                if throttleBlockedUntilNs < now {
+                    throttleBlockedUntilNs = now
+                }
+            }
+        }
+
+        func throttleUpdateRate(now: UInt64) {
+            let dtNs = now &- throttleRateLastNs
+            guard dtNs >= throttleRateUpdateNs else { return }
+            let delta = completed - throttleRateLastCompleted
+            throttleRateLastNs = now
+            throttleRateLastCompleted = completed
+            guard dtNs > 0, delta > 0 else { return }
+            let rate = Double(delta) / (Double(dtNs) / 1e9)
+            guard rate.isFinite, rate > 0 else { return }
+            let factor = p.gpuThroughput.factor()
+            if throttleRateEstimate <= 0 {
+                throttleRateEstimate = rate
+                return
+            }
+            if factor >= 0.99 {
+                throttleRateEstimate = throttleRateEstimate * (1.0 - throttleRateEwma) + rate * throttleRateEwma
+                return
+            }
+            if rate > throttleRateEstimate {
+                throttleRateEstimate = rate
+            }
+        }
+
+        func throttleCanEnqueue(now: UInt64, count: Int) -> Bool {
+            let factor = p.gpuThroughput.factor()
+            guard throttleEnabled(factor) else { return true }
+            throttleUpdateWindow(now: now)
+            guard throttleRateEstimate > 0 else { return true }
+            let windowSec = Double(throttleWindowNs) / 1e9
+            let budget = throttleRateEstimate * factor * windowSec
+            if budget <= 0 { return false }
+            if Double(throttleWindowUsed + count) > budget {
+                throttleBlockedUntilNs = max(throttleBlockedUntilNs, throttleWindowStartNs &+ throttleWindowNs)
+                return false
+            }
+            throttleWindowUsed += count
+            return true
+        }
+
+        func throttleIsBlocked(now: UInt64) -> Bool {
+            let factor = p.gpuThroughput.factor()
+            guard throttleEnabled(factor) else { return false }
+            throttleUpdateWindow(now: now)
+            return now < throttleBlockedUntilNs
         }
 
         func maybeSaveTune(now: UInt64) {
@@ -798,6 +894,7 @@ final class ExploreMPSManager: @unchecked Sendable {
             guard autoEnabled else { return }
             guard !tuneSettled else { return }
             guard pendingTune == nil else { return }
+            if p.gpuThroughput.factor() < 0.99 { return }
             let elapsedNs = now &- lastTuneNs
             guard elapsedNs >= tuneInterval else { return }
 
@@ -866,6 +963,7 @@ final class ExploreMPSManager: @unchecked Sendable {
             guard tuneSettled else { return }
             guard !inflightTuneSettled else { return }
             guard pendingTune == nil else { return }
+            if p.gpuThroughput.factor() < 0.99 { return }
             let elapsedNs = now &- inflightLastTuneNs
             guard elapsedNs >= inflightTuneInterval else { return }
 
@@ -920,7 +1018,7 @@ final class ExploreMPSManager: @unchecked Sendable {
             scheduleTune(batch: batch, inflight: next, reason: String(format: "autotune inflight rate=%.0f/s", rate))
         }
 
-        func enqueueNext() -> Bool {
+        func enqueueNext(now: UInt64) -> Bool {
             if p.stop.isStopRequested() { return false }
             if let q = quota, enqueued >= q { return false }
 
@@ -929,6 +1027,7 @@ final class ExploreMPSManager: @unchecked Sendable {
                 n = min(n, q - enqueued)
                 if n <= 0 { return false }
             }
+            if !throttleCanEnqueue(now: now, count: n) { return false }
 
             for i in 0..<n {
                 guard let s = nextSeed() else {
@@ -957,7 +1056,9 @@ final class ExploreMPSManager: @unchecked Sendable {
                     processBatch(seedsBuf: seedsBuf, scoresBuf: scoresBuf, count: job.count)
                 }
                 completed += job.count
-                lastProgressNs = DispatchTime.now().uptimeNanoseconds
+                let endNs = DispatchTime.now().uptimeNanoseconds
+                lastProgressNs = endNs
+                throttleUpdateRate(now: endNs)
                 recoveryAttempts = 0
             } catch {
                 let recovered = recoverFromError(error)
@@ -971,21 +1072,31 @@ final class ExploreMPSManager: @unchecked Sendable {
 
         while true {
             let now = DispatchTime.now().uptimeNanoseconds
+            let paused = p.pause.isPaused()
             noSeedsAvailable = false
+            throttleResetIfDisabled(now: now)
             applyPendingTune(now: now)
             maybeReinit()
             maybeTune(now: now)
             maybeTuneInflight(now: now)
             maybeSaveTune(now: now)
 
-            if pendingTune == nil {
+            if !paused, pendingTune == nil {
                 while pending.count < inflight {
-                    if !enqueueNext() { break }
+                    if !enqueueNext(now: now) { break }
                 }
             }
             if drainOne() { continue }
             if p.stop.isStopRequested(), pending.isEmpty { break }
             if let q = quota, completed >= q, pending.isEmpty { break }
+            if paused {
+                if pending.isEmpty {
+                    if !p.pause.waitIfPaused(stop: p.stop) { break }
+                } else {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                continue
+            }
             if noSeedsAvailable, pending.isEmpty {
                 if !p.endless { break }
                 let recovered = recoverFromError(ExploreMPSStallError.noSeeds)
@@ -996,6 +1107,18 @@ final class ExploreMPSManager: @unchecked Sendable {
                     break
                 }
                 continue
+            }
+            if pending.isEmpty {
+                let idleNow = DispatchTime.now().uptimeNanoseconds
+                if throttleIsBlocked(now: idleNow) {
+                    lastProgressNs = idleNow
+                    let remainingNs = throttleBlockedUntilNs &- idleNow
+                    let sleepSec = min(0.5, Double(remainingNs) / 1e9)
+                    if sleepSec >= 0.001 {
+                        Thread.sleep(forTimeInterval: sleepSec)
+                    }
+                    continue
+                }
             }
             let stalledForNs = now &- lastProgressNs
             if pending.isEmpty, stalledForNs >= stallTimeoutNs {

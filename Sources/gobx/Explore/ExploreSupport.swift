@@ -1,17 +1,17 @@
 import Dispatch
 import Foundation
 
-final class ExploreStats: @unchecked Sendable {
-    struct Snapshot {
-        let cpuCount: UInt64
-        let cpuScoreSum: Double
-        let cpuScoreSumSq: Double
-        let cpuVerifyCount: UInt64
-        let cpuVerifyScoreSum: Double
-        let cpuVerifyScoreSumSq: Double
-        let mpsCount: UInt64
-        let mpsScoreSum: Double
-        let mpsScoreSumSq: Double
+public final class ExploreStats: @unchecked Sendable {
+    public struct Snapshot {
+        public let cpuCount: UInt64
+        public let cpuScoreSum: Double
+        public let cpuScoreSumSq: Double
+        public let cpuVerifyCount: UInt64
+        public let cpuVerifyScoreSum: Double
+        public let cpuVerifyScoreSumSq: Double
+        public let mpsCount: UInt64
+        public let mpsScoreSum: Double
+        public let mpsScoreSumSq: Double
     }
 
     private let lock = NSLock()
@@ -52,7 +52,7 @@ final class ExploreStats: @unchecked Sendable {
         lock.unlock()
     }
 
-    func snapshot() -> Snapshot {
+    public func snapshot() -> Snapshot {
         lock.lock()
         let s = Snapshot(
             cpuCount: cpuCount,
@@ -70,11 +70,11 @@ final class ExploreStats: @unchecked Sendable {
     }
 }
 
-final class BestTracker: @unchecked Sendable {
-    struct Snapshot {
-        let seed: UInt64
-        let score: Double
-        let source: String?
+public final class BestTracker: @unchecked Sendable {
+    public struct Snapshot {
+        public let seed: UInt64
+        public let score: Double
+        public let source: String?
     }
 
     private let lock = NSLock()
@@ -92,7 +92,7 @@ final class BestTracker: @unchecked Sendable {
         return true
     }
 
-    func snapshot() -> Snapshot {
+    public func snapshot() -> Snapshot {
         lock.lock()
         let s = Snapshot(seed: bestSeed, score: bestScore, source: bestSource)
         lock.unlock()
@@ -100,7 +100,7 @@ final class BestTracker: @unchecked Sendable {
     }
 }
 
-final class AdaptiveMargin: @unchecked Sendable {
+public final class AdaptiveMargin: @unchecked Sendable {
     struct Update {
         let oldValue: Double
         let newValue: Double
@@ -148,14 +148,14 @@ final class AdaptiveMargin: @unchecked Sendable {
         self.minDelta = max(0.0, minDelta)
     }
 
-    func current() -> Double {
+    public func current() -> Double {
         lock.lock()
         let v = margin
         lock.unlock()
         return v
     }
 
-    func trendSymbol() -> String {
+    public func trendSymbol() -> String {
         lock.lock()
         let t = trend
         lock.unlock()
@@ -208,10 +208,10 @@ final class AdaptiveMargin: @unchecked Sendable {
     }
 }
 
-final class ApproxBestTracker: @unchecked Sendable {
-    struct Snapshot {
-        let seed: UInt64
-        let score: Float
+public final class ApproxBestTracker: @unchecked Sendable {
+    public struct Snapshot {
+        public let seed: UInt64
+        public let score: Float
     }
 
     private let lock = NSLock()
@@ -227,7 +227,7 @@ final class ApproxBestTracker: @unchecked Sendable {
         return true
     }
 
-    func snapshot() -> Snapshot {
+    public func snapshot() -> Snapshot {
         lock.lock()
         let s = Snapshot(seed: bestSeed, score: bestScore)
         lock.unlock()
@@ -235,14 +235,20 @@ final class ApproxBestTracker: @unchecked Sendable {
     }
 }
 
-final class SubmissionState: @unchecked Sendable {
-    struct Snapshot {
-        let top500Threshold: Double
-        let lastRefresh: Date
-        let knownCount: Int
+public final class SubmissionState: @unchecked Sendable {
+    public struct Snapshot {
+        public let top500Threshold: Double
+        public let lastRefresh: Date
+        public let knownCount: Int
+        public let topBestScore: Double?
+        public let topBestSeed: UInt64?
+        public let personalBestScore: Double?
+        public let personalBestSeed: UInt64?
+        public let personalBestRank: Int?
     }
 
     private let lock = NSLock()
+    private let profileId: String?
     private var topSeeds = Set<UInt64>()
     private var acceptedSeeds = Set<UInt64>()
     private var acceptedOrder: [UInt64] = []
@@ -250,6 +256,15 @@ final class SubmissionState: @unchecked Sendable {
     private var topScores: [Double] = []
     private var top500Threshold: Double = -Double.infinity
     private var lastRefresh: Date = .distantPast
+    private var topBestScore: Double? = nil
+    private var topBestSeed: UInt64? = nil
+    private var personalBestScore: Double? = nil
+    private var personalBestSeed: UInt64? = nil
+    private var personalBestRank: Int? = nil
+
+    init(profileId: String? = nil) {
+        self.profileId = profileId
+    }
 
     func mergeTop(_ top: TopResponse) {
         lock.lock()
@@ -257,6 +272,42 @@ final class SubmissionState: @unchecked Sendable {
         topSeeds.removeAll(keepingCapacity: true)
         topSeeds.reserveCapacity(top.images.count)
         for img in top.images { topSeeds.insert(img.seed) }
+        if let best = top.images.max(by: { $0.score < $1.score }) {
+            topBestScore = best.score
+            topBestSeed = best.seed
+        } else {
+            topBestScore = nil
+            topBestSeed = nil
+        }
+        if let profileId, !profileId.isEmpty {
+            if let personal = top.images.filter({ $0.discovererId == profileId }).max(by: { $0.score < $1.score }) {
+                personalBestScore = personal.score
+                personalBestSeed = personal.seed
+                if let rank = personal.rank {
+                    personalBestRank = rank
+                } else {
+                    let sorted = top.images.sorted {
+                        if $0.score == $1.score {
+                            return ($0.rank ?? Int.max) < ($1.rank ?? Int.max)
+                        }
+                        return $0.score > $1.score
+                    }
+                    if let idx = sorted.firstIndex(where: { $0.seed == personal.seed }) {
+                        personalBestRank = idx + 1
+                    } else {
+                        personalBestRank = nil
+                    }
+                }
+            } else {
+                personalBestScore = nil
+                personalBestSeed = nil
+                personalBestRank = nil
+            }
+        } else {
+            personalBestScore = nil
+            personalBestSeed = nil
+            personalBestRank = nil
+        }
         if let last = topScores.last {
             top500Threshold = last
         }
@@ -328,7 +379,7 @@ final class SubmissionState: @unchecked Sendable {
         lock.unlock()
     }
 
-    func snapshot() -> Snapshot {
+    public func snapshot() -> Snapshot {
         lock.lock()
         var knownCount = topSeeds.count
         if !acceptedSeeds.isEmpty {
@@ -339,7 +390,12 @@ final class SubmissionState: @unchecked Sendable {
         let s = Snapshot(
             top500Threshold: top500Threshold,
             lastRefresh: lastRefresh,
-            knownCount: knownCount
+            knownCount: knownCount,
+            topBestScore: topBestScore,
+            topBestSeed: topBestSeed,
+            personalBestScore: personalBestScore,
+            personalBestSeed: personalBestSeed,
+            personalBestRank: personalBestRank
         )
         lock.unlock()
         return s
@@ -426,14 +482,65 @@ actor SubmissionRateLimiter {
     }
 }
 
-final class SubmissionManager: @unchecked Sendable {
-    struct AcceptedSeed: Sendable {
-        let time: Date
-        let seed: UInt64
-        let score: Double
-        let difficultyPercentile: Double?
-        let rank: Int?
-        let source: String?
+public enum SubmissionLogKind: String, Sendable {
+    case accepted
+    case rejected
+    case rateLimited
+    case failed
+}
+
+public struct SubmissionLogEntry: Sendable {
+    public let time: Date
+    public let kind: SubmissionLogKind
+    public let seed: UInt64
+    public let score: Double
+    public let rank: Int?
+    public let difficultyPercentile: Double?
+    public let message: String?
+    public let source: String?
+}
+
+final class SubmissionLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [SubmissionLogEntry] = []
+    private let capacity: Int
+
+    init(capacity: Int = 2000) {
+        self.capacity = max(100, capacity)
+        entries.reserveCapacity(min(self.capacity, 4096))
+    }
+
+    func append(_ entry: SubmissionLogEntry) {
+        lock.withLock {
+            entries.append(entry)
+            if entries.count > capacity {
+                entries.removeFirst(entries.count - capacity)
+            }
+        }
+    }
+
+    func count() -> Int {
+        lock.withLock { entries.count }
+    }
+
+    func snapshot(from start: Int, limit: Int) -> [SubmissionLogEntry] {
+        lock.withLock {
+            let clampedStart = max(0, min(start, entries.count))
+            let clampedEnd = min(entries.count, clampedStart + max(0, limit))
+            guard clampedStart < clampedEnd else { return [] }
+            return Array(entries[clampedStart..<clampedEnd])
+        }
+    }
+}
+
+public final class SubmissionManager: @unchecked Sendable {
+    public struct AcceptedSeed: Sendable {
+        public let time: Date
+        public let seed: UInt64
+        public let score: Double
+        public let difficultyPercentile: Double?
+        public let rank: Int?
+        public let source: String?
     }
 
     private struct SubmissionTask: Sendable {
@@ -461,15 +568,15 @@ final class SubmissionManager: @unchecked Sendable {
         let seq: UInt64
     }
 
-    struct StatsSnapshot: Sendable {
-        let submitAttempts: UInt64
-        let acceptedCount: UInt64
-        let rejectedCount: UInt64
-        let rateLimitedCount: UInt64
-        let failedCount: UInt64
-        let queuedCount: Int
-        let queuedMinScore: Double?
-        let queuedMaxScore: Double?
+    public struct StatsSnapshot: Sendable {
+        public let submitAttempts: UInt64
+        public let acceptedCount: UInt64
+        public let rejectedCount: UInt64
+        public let rateLimitedCount: UInt64
+        public let failedCount: UInt64
+        public let queuedCount: Int
+        public let queuedMinScore: Double?
+        public let queuedMaxScore: Double?
     }
 
     private let config: AppConfig
@@ -510,6 +617,7 @@ final class SubmissionManager: @unchecked Sendable {
     private var accepted: [AcceptedSeed] = []
     private var acceptedBest: [AcceptedSeed] = []
     private let acceptedCapacity = 20
+    private let submissionLog = SubmissionLog(capacity: 2000)
     private var lastRateLimitSeed: UInt64? = nil
     private var lastRateLimitMessage: String? = nil
 
@@ -563,6 +671,28 @@ final class SubmissionManager: @unchecked Sendable {
         }
     }
 
+    private func recordSubmissionLog(
+        kind: SubmissionLogKind,
+        seed: UInt64,
+        score: Double,
+        rank: Int?,
+        percentile: Double?,
+        message: String?,
+        source: String?
+    ) {
+        let entry = SubmissionLogEntry(
+            time: Date(),
+            kind: kind,
+            seed: seed,
+            score: score,
+            rank: rank,
+            difficultyPercentile: percentile,
+            message: message,
+            source: source
+        )
+        submissionLog.append(entry)
+    }
+
     private func retryDelay(attempt: Int) -> TimeInterval {
         let step = max(1, attempt)
         let raw = retryBaseSec * pow(2.0, Double(step - 1))
@@ -571,11 +701,11 @@ final class SubmissionManager: @unchecked Sendable {
         return max(0.0, delay + jitter)
     }
 
-    func effectiveThreshold() -> Double {
+    public func effectiveThreshold() -> Double {
         state.effectiveThreshold(userMinScore: userMinScore)
     }
 
-    func stateSnapshot() -> SubmissionState.Snapshot {
+    public func stateSnapshot() -> SubmissionState.Snapshot {
         state.snapshot()
     }
 
@@ -587,12 +717,20 @@ final class SubmissionManager: @unchecked Sendable {
         return out
     }
 
-    func acceptedBestSnapshot(limit: Int) -> [AcceptedSeed] {
+    public func acceptedBestSnapshot(limit: Int) -> [AcceptedSeed] {
         acceptedLock.lock()
         let n = min(max(0, limit), acceptedBest.count)
         let out = n == 0 ? [] : Array(acceptedBest.prefix(n))
         acceptedLock.unlock()
         return out
+    }
+
+    public func submissionLogCount() -> Int {
+        submissionLog.count()
+    }
+
+    public func submissionLogSnapshot(from start: Int, limit: Int) -> [SubmissionLogEntry] {
+        submissionLog.snapshot(from: start, limit: limit)
     }
 
     private func updateAcceptedBestLocked(_ entry: AcceptedSeed) {
@@ -611,7 +749,7 @@ final class SubmissionManager: @unchecked Sendable {
         }
     }
 
-    func statsSnapshot() -> StatsSnapshot {
+    public func statsSnapshot() -> StatsSnapshot {
         statsLock.lock()
         let snap = StatsSnapshot(
             submitAttempts: submitAttempts,
@@ -719,8 +857,21 @@ final class SubmissionManager: @unchecked Sendable {
         }
     }
 
-    func waitForPendingSubmissions() {
-        pending.wait()
+    func waitForPendingSubmissions(stop: StopFlag? = nil, timeoutSec: Double? = nil) -> Bool {
+        let interval: TimeInterval = 0.25
+        let deadline = timeoutSec.map { Date().addingTimeInterval(max(0.0, $0)) }
+        while true {
+            if let stop, stop.isStopRequested() {
+                return false
+            }
+            let result = pending.wait(timeout: .now() + interval)
+            if result == .success {
+                return true
+            }
+            if let deadline, Date() >= deadline {
+                return false
+            }
+        }
     }
 
     func flushJournal() {
@@ -807,6 +958,7 @@ final class SubmissionManager: @unchecked Sendable {
                 if attempts > maxRetries {
                     emit(.error, "Submission failed for \(task.seed)\(tag)")
                     recordFailed()
+                    recordSubmissionLog(kind: .failed, seed: task.seed, score: task.score, rank: nil, percentile: nil, message: "max retries", source: task.source)
                     return .completed
                 }
                 let delay = retryDelay(attempt: attempts)
@@ -841,6 +993,7 @@ final class SubmissionManager: @unchecked Sendable {
                     let msg = "Accepted seed=\(task.seed) score=\(String(format: "%.6f", task.score)) rank=\(res.rank ?? 0)\(pctStr)\(tag)"
                     printLock.withLock { print(formatLogLine(msg, includeTimestamp: logTimestamps)) }
                 }
+                recordSubmissionLog(kind: .accepted, seed: task.seed, score: task.score, rank: res.rank, percentile: percentile, message: nil, source: task.source)
                 return .completed
             }
 
@@ -848,6 +1001,8 @@ final class SubmissionManager: @unchecked Sendable {
                 recordRateLimited()
                 let delay = await limiter.recordRateLimit()
                 emitRateLimit(seed: task.seed, tag: tag, delay: delay)
+                let delayStr = String(format: "%.1f", delay)
+                recordSubmissionLog(kind: .rateLimited, seed: task.seed, score: task.score, rank: nil, percentile: nil, message: "backoff \(delayStr)s", source: task.source)
                 return .requeue(delay: delay)
             }
 
@@ -856,6 +1011,7 @@ final class SubmissionManager: @unchecked Sendable {
                 if attempts > maxRetries {
                     emit(.error, "Submission failed for \(task.seed)\(tag) (\(res.message ?? "unknown"))")
                     recordFailed()
+                    recordSubmissionLog(kind: .failed, seed: task.seed, score: task.score, rank: nil, percentile: nil, message: res.message ?? "unknown", source: task.source)
                     return .completed
                 }
                 let delay = retryDelay(attempt: attempts)
@@ -868,6 +1024,7 @@ final class SubmissionManager: @unchecked Sendable {
             await limiter.recordSuccess()
             recordRejected()
             emit(.rejected, "Rejected seed=\(task.seed) score=\(String(format: "%.6f", task.score)) (\(res.message ?? "unknown"))\(tag)")
+            recordSubmissionLog(kind: .rejected, seed: task.seed, score: task.score, rank: res.rank, percentile: nil, message: res.message ?? "unknown", source: task.source)
             return .completed
         }
     }
@@ -1000,7 +1157,7 @@ final class SubmissionManager: @unchecked Sendable {
     }
 }
 
-final class AdaptiveScoreShift: @unchecked Sendable {
+public final class AdaptiveScoreShift: @unchecked Sendable {
     struct Update {
         let oldValue: Double
         let newValue: Double
@@ -1046,14 +1203,14 @@ final class AdaptiveScoreShift: @unchecked Sendable {
         self.minDelta = max(0.0, minDelta)
     }
 
-    func current() -> Double {
+    public func current() -> Double {
         lock.lock()
         let v = shift
         lock.unlock()
         return v
     }
 
-    func trendSymbol() -> String {
+    public func trendSymbol() -> String {
         lock.lock()
         let t = trend
         lock.unlock()
@@ -1323,10 +1480,34 @@ final class CandidateVerifier: @unchecked Sendable {
         }
     }
 
-    func wait() {
+    func wait(stop: StopFlag? = nil, timeoutSec: Double? = nil) -> Bool {
         taskQueue.close()
-        pending.wait()
-        workerGroup.wait()
+        let interval: TimeInterval = 0.25
+        let deadline = timeoutSec.map { Date().addingTimeInterval(max(0.0, $0)) }
+        while true {
+            if let stop, stop.isStopRequested() {
+                return false
+            }
+            let result = pending.wait(timeout: .now() + interval)
+            if result == .success {
+                break
+            }
+            if let deadline, Date() >= deadline {
+                return false
+            }
+        }
+        while true {
+            if let stop, stop.isStopRequested() {
+                return false
+            }
+            let result = workerGroup.wait(timeout: .now() + interval)
+            if result == .success {
+                return true
+            }
+            if let deadline, Date() >= deadline {
+                return false
+            }
+        }
     }
 
     private func process(_ task: VerifyTask) {
@@ -1359,20 +1540,62 @@ final class CandidateVerifier: @unchecked Sendable {
     }
 }
 
-final class StopFlag: @unchecked Sendable {
+public final class StopFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var stopRequested = false
 
-    func requestStop() {
+    public func requestStop() {
         lock.lock()
         stopRequested = true
         lock.unlock()
     }
 
-    func isStopRequested() -> Bool {
+    public func reset() {
+        lock.lock()
+        stopRequested = false
+        lock.unlock()
+    }
+
+    public func isStopRequested() -> Bool {
         lock.lock()
         let v = stopRequested
         lock.unlock()
         return v
+    }
+}
+
+public final class PauseFlag: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var paused = false
+
+    public init() {}
+
+    public func setPaused(_ value: Bool) {
+        condition.lock()
+        paused = value
+        if !paused {
+            condition.broadcast()
+        }
+        condition.unlock()
+    }
+
+    public func isPaused() -> Bool {
+        condition.lock()
+        let v = paused
+        condition.unlock()
+        return v
+    }
+
+    public func waitIfPaused(stop: StopFlag? = nil) -> Bool {
+        condition.lock()
+        while paused {
+            if let stop, stop.isStopRequested() {
+                condition.unlock()
+                return false
+            }
+            condition.wait(until: Date(timeIntervalSinceNow: 0.25))
+        }
+        condition.unlock()
+        return true
     }
 }

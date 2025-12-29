@@ -35,6 +35,9 @@ jobs:
       - name: Selftest (CPU)
         run: ./.build/release/gobx selftest
 
+      - name: Package menubar app
+        run: make bundle-menubar
+
       - name: Package
         shell: bash
         run: |
@@ -42,13 +45,26 @@ jobs:
           arch="$(uname -m)"
           mkdir -p dist
           cp .build/release/gobx dist/
-          if [[ -d ".build/release/gobx_gobx.bundle" ]]; then
-            cp -R .build/release/gobx_gobx.bundle dist/
-          elif [[ -d ".build/release/gobx_GobxCore.bundle" ]]; then
-            cp -R .build/release/gobx_GobxCore.bundle dist/gobx_gobx.bundle
+          bundles=()
+          if [[ -d ".build/release/gobx_GobxCore.bundle" ]]; then
+            bundles+=("gobx_GobxCore.bundle")
           fi
-          tar -czf "gobx-macos-${arch}.tar.gz" -C dist gobx gobx_gobx.bundle
+          if [[ -d ".build/release/gobx_gobx.bundle" ]]; then
+            bundles+=("gobx_gobx.bundle")
+          fi
+          if [[ "${#bundles[@]}" -eq 0 ]]; then
+            echo "Missing GobxCore resource bundle in .build/release" >&2
+            exit 1
+          fi
+          for bundle in "${bundles[@]}"; do
+            cp -R ".build/release/$bundle" dist/
+          done
+          tar -czf "gobx-macos-${arch}.tar.gz" -C dist gobx "${bundles[@]}"
           shasum -a 256 "gobx-macos-${arch}.tar.gz" > "gobx-macos-${arch}.tar.gz.sha256"
+          if [[ -d "dist/Gobx Menubar.app" ]]; then
+            ditto -c -k --sequesterRsrc --keepParent "dist/Gobx Menubar.app" "gobx-menubar-macos-${arch}.zip"
+            shasum -a 256 "gobx-menubar-macos-${arch}.zip" > "gobx-menubar-macos-${arch}.zip.sha256"
+          fi
 
       - name: Update nightly tag
         run: |
@@ -73,4 +89,8 @@ jobs:
             gh release create nightly --title "Nightly" --notes "${notes}" --prerelease
           fi
 
-          gh release upload nightly "gobx-macos-${arch}.tar.gz" "gobx-macos-${arch}.tar.gz.sha256" --clobber
+          assets=("gobx-macos-${arch}.tar.gz" "gobx-macos-${arch}.tar.gz.sha256")
+          if [[ -f "gobx-menubar-macos-${arch}.zip" ]]; then
+            assets+=("gobx-menubar-macos-${arch}.zip" "gobx-menubar-macos-${arch}.zip.sha256")
+          fi
+          gh release upload nightly "${assets[@]}" --clobber

@@ -1,8 +1,8 @@
 import Darwin
 import Foundation
 
-enum GobxCLI {
-    static func main() async {
+public enum GobxCLI {
+    public static func main() async {
         CrashReporter.install()
         do {
             let args = Array(CommandLine.arguments.dropFirst())

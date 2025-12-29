@@ -1,4 +1,5 @@
 import Foundation
+import GobxCore
 
 @main
 enum GobxMain {

@@ -26,6 +26,9 @@ jobs:
       - name: Build (release)
         run: make build-release
 
+      - name: Package menubar app
+        run: make bundle-menubar
+
       - name: Selftest (CPU)
         run: ./.build/release/gobx selftest
 
@@ -35,5 +38,7 @@ jobs:
           name: gobx-macos-${{ runner.arch }}
           path: |
             ./.build/release/gobx
+            ./.build/release/gobx_GobxCore.bundle
             ./.build/release/gobx_gobx.bundle
+            ./dist/Gobx Menubar.app
           if-no-files-found: error

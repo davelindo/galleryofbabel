@@ -4,34 +4,54 @@ import Foundation
 import FoundationNetworking
 #endif
 
-struct AppConfig: Codable {
-    let profile: Profile?
-    let stats: StatsConfig?
+public struct AppConfig: Codable, Sendable {
+    public let profile: Profile?
+    public let stats: StatsConfig?
 
-    struct Profile: Codable {
-        let id: String
-        let name: String
-        let xProfile: String?
+    public init(profile: Profile?, stats: StatsConfig?) {
+        self.profile = profile
+        self.stats = stats
+    }
 
-        static let defaultAuthor = Profile(
+    public struct Profile: Codable, Sendable {
+        public let id: String
+        public let name: String
+        public let xProfile: String?
+
+        public init(id: String, name: String, xProfile: String?) {
+            self.id = id
+            self.name = name
+            self.xProfile = xProfile
+        }
+
+        public static let defaultAuthor = Profile(
             id: "user_mj95qm9x_adu1a3a11",
             name: "DreamingDragon588",
             xProfile: "davelindon10"
         )
     }
 
-    struct StatsConfig: Codable {
-        let enabled: Bool
-        let url: String?
+    public struct StatsConfig: Codable, Sendable {
+        public let enabled: Bool
+        public let url: String?
+
+        public init(enabled: Bool, url: String?) {
+            self.enabled = enabled
+            self.url = url
+        }
     }
 }
 
-func loadConfig() -> AppConfig? {
+public func loadConfig() -> AppConfig? {
     guard let data = try? Data(contentsOf: GobxPaths.configURL) else { return nil }
     return try? JSONDecoder().decode(AppConfig.self, from: data)
 }
 
-func saveConfig(_ config: AppConfig, to url: URL = GobxPaths.configURL) throws {
+public func saveConfig(_ config: AppConfig) throws {
+    try saveConfig(config, to: GobxPaths.configURL)
+}
+
+public func saveConfig(_ config: AppConfig, to url: URL) throws {
     let enc = JSONEncoder()
     enc.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try enc.encode(config)
@@ -147,6 +167,10 @@ struct TopResponse: Decodable {
     struct Image: Decodable {
         let seed: UInt64
         let score: Double
+        let rank: Int?
+        let discovererId: String?
+        let discovererName: String?
+        let discovererXProfile: String?
     }
 
     let images: [Image]
@@ -158,5 +182,7 @@ func fetchTop(limit: Int, config: AppConfig, uniqueUsers: Bool = false) async ->
     guard let url = URL(string: urlStr) else { return nil }
     guard let res = await runHTTP(url: url, method: "GET", jsonBody: nil, timeoutSec: 15) else { return nil }
     guard res.statusCode == 200 else { return nil }
-    return try? JSONDecoder().decode(TopResponse.self, from: res.body)
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    return try? decoder.decode(TopResponse.self, from: res.body)
 }

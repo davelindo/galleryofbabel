@@ -20,6 +20,7 @@ final class ExploreCPUWorker: @unchecked Sendable {
         let effectiveDoSubmit: Bool
         let minScore: Double
         let stop: StopFlag
+        let pause: PauseFlag
     }
 
     private let p: Params
@@ -98,7 +99,10 @@ final class ExploreCPUWorker: @unchecked Sendable {
             var stopCheck = 0
             while true {
                 if let q = quota, processed >= q { break }
-                if stopCheck == 0, p.stop.isStopRequested() { break }
+                if stopCheck == 0 {
+                    if p.stop.isStopRequested() { break }
+                    if !p.pause.waitIfPaused(stop: p.stop) { break }
+                }
 
                 if useState {
                     if remainingInClaim == 0 {
