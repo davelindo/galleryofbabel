@@ -9,6 +9,10 @@ struct TerminalSize: Sendable {
 }
 
 enum Terminal {
+    struct RawModeState {
+        let original: termios
+    }
+
     static func isInteractiveStdout() -> Bool {
         guard isatty(fileno(stdout)) != 0 else { return false }
         let term = ProcessInfo.processInfo.environment["TERM"] ?? ""
@@ -32,6 +36,29 @@ enum Terminal {
     static func writeStdout(_ s: String) {
         guard let data = s.data(using: .utf8) else { return }
         FileHandle.standardOutput.write(data)
+    }
+
+    static func enableRawMode() -> RawModeState? {
+        var term = termios()
+        guard tcgetattr(fileno(stdin), &term) == 0 else { return nil }
+        let original = term
+
+        term.c_lflag &= ~UInt(ECHO | ICANON)
+        term.c_iflag &= ~UInt(IXON | ICRNL)
+        withUnsafeMutablePointer(to: &term.c_cc) { ptr in
+            ptr.withMemoryRebound(to: cc_t.self, capacity: Int(NCCS)) { buf in
+                buf[Int(VMIN)] = 0
+                buf[Int(VTIME)] = 0
+            }
+        }
+
+        guard tcsetattr(fileno(stdin), TCSAFLUSH, &term) == 0 else { return nil }
+        return RawModeState(original: original)
+    }
+
+    static func restoreMode(_ state: RawModeState) {
+        var term = state.original
+        _ = tcsetattr(fileno(stdin), TCSAFLUSH, &term)
     }
 }
 

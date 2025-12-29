@@ -36,13 +36,13 @@ enum GobxError: Error, CustomStringConvertible {
     }
 }
 
-enum Backend: String {
+public enum Backend: String, Sendable {
     case cpu
     case mps
     case all
 }
 
-enum GPUBackend: String {
+public enum GPUBackend: String, Sendable {
     case mps
     case metal
 }

@@ -1,8 +1,8 @@
 @preconcurrency import Dispatch
 import Foundation
 
-enum ExploreRunner {
-    static func run(options: ExploreOptions) async throws {
+public enum ExploreRunner {
+    public static func run(options: ExploreOptions, uiBridge: ExploreUIBridge? = nil) async throws {
         var count = options.count
         var endlessFlag = options.endlessFlag
         let startSeed = options.startSeed
@@ -84,7 +84,7 @@ enum ExploreRunner {
             return 0.25
         }()
 
-        let eventLog: ExploreEventLog? = uiEnabledFinal ? ExploreEventLog(capacity: 400) : nil
+        let eventLog: ExploreEventLog? = uiBridge?.events ?? (uiEnabledFinal ? ExploreEventLog(capacity: 2000) : nil)
 
         func emit(_ kind: ExploreEventKind = .info, _ message: String) {
             if let eventLog {
@@ -284,10 +284,11 @@ enum ExploreRunner {
             }
         }()
 
-        let stats = ExploreStats()
-        let best = BestTracker()
-        let bestApprox = ApproxBestTracker()
-        let stop = StopFlag()
+        let stats = uiBridge?.stats ?? ExploreStats()
+        let best = uiBridge?.best ?? BestTracker()
+        let bestApprox = uiBridge?.bestApprox ?? ApproxBestTracker()
+        let stop = uiBridge?.stop ?? StopFlag()
+        let pause = uiBridge?.pause ?? PauseFlag()
         let topApproxTracker = TopApproxTracker(limit: topN)
 
         var memGuardTimer: DispatchSourceTimer? = nil
@@ -513,7 +514,7 @@ enum ExploreRunner {
                 return AppConfig(profile: defaultProfile, stats: nil)
             }()
 
-            let state = SubmissionState()
+            let state = SubmissionState(profileId: configForSubmit.profile?.id)
             if topUniqueUsers {
                 emit(.info, "Using unique-user top list for thresholds")
             }
@@ -542,6 +543,7 @@ enum ExploreRunner {
                 logTimestamps: logTimestamps,
                 events: eventLog
             )
+            uiBridge?.setSubmission(submission)
 
             let interval = max(10.0, refreshEverySec)
             if interval.isFinite && interval > 0 {
@@ -575,12 +577,24 @@ enum ExploreRunner {
         }
 
         let mpsMarginAutoFinal = mpsMarginAuto && effectiveDoSubmit && (resolvedBackendFinal == .mps || resolvedBackendFinal == .all)
+        let gpuThroughput = GPUThroughputLimiter(profile: options.gpuThroughputProfile)
         let mpsMarginTracker = AdaptiveMargin(initial: mpsVerifyMargin, autoEnabled: mpsMarginAutoFinal)
         let mpsShiftAutoFinal = mpsMarginAutoFinal && (gpuBackend == .metal)
         let mpsShiftTracker = AdaptiveScoreShift(initial: mpsScoreShift, autoEnabled: mpsShiftAutoFinal)
         if mpsMarginAutoFinal {
             emit(.info, "Adaptive mps-margin enabled: initial=\(String(format: "%.6f", mpsMarginTracker.current()))")
         }
+
+        let uiContext = ExploreUIContext(
+            backend: resolvedBackendFinal,
+            endless: endless,
+            totalTarget: totalTarget,
+            mpsVerifyMargin: mpsMarginTracker,
+            mpsScoreShift: mpsShiftTracker,
+            minScore: minScore,
+            gpuThroughput: gpuThroughput
+        )
+        uiBridge?.setContext(uiContext)
 
         let candidateVerifier: CandidateVerifier? = {
             guard effectiveDoSubmit else { return nil }
@@ -789,14 +803,7 @@ enum ExploreRunner {
         var ui: ExploreLiveUI? = nil
         if uiEnabledFinal, let eventLog {
             ui = ExploreLiveUI(
-                context: .init(
-                    backend: resolvedBackendFinal,
-                    endless: endless,
-                    totalTarget: totalTarget,
-                    mpsVerifyMargin: mpsMarginTracker,
-                    mpsScoreShift: mpsShiftTracker,
-                    minScore: minScore
-                ),
+                context: uiContext,
                 stats: stats,
                 best: best,
                 bestApprox: bestApprox,
@@ -838,7 +845,8 @@ enum ExploreRunner {
                     submission: submissionForWorkers,
                     effectiveDoSubmit: effectiveDoSubmitForWorkers,
                     minScore: minScoreForWorkers,
-                    stop: stop
+                    stop: stop,
+                    pause: pause
                 ))
                 worker.run()
             }
@@ -876,6 +884,7 @@ enum ExploreRunner {
                     minScore: minScoreForWorkers,
                     mpsVerifyMargin: mpsMarginTracker,
                     mpsScoreShift: mpsScoreShiftSnapshot,
+                    gpuThroughput: gpuThroughput,
                     effectiveDoSubmit: effectiveDoSubmitForWorkers,
                     submission: submissionForWorkers,
                     verifier: candidateVerifier,
@@ -887,6 +896,7 @@ enum ExploreRunner {
                     topApproxLimit: topN,
                     topApproxTracker: topApproxTracker,
                     stop: stop,
+                    pause: pause,
                     scorer: scorer,
                     makeScorer: makeScorerSnapshot
                 ))
@@ -905,8 +915,15 @@ enum ExploreRunner {
         if stopRequested {
             submission?.flushJournal()
         } else {
-            candidateVerifier?.wait()
-            submission?.waitForPendingSubmissions()
+            let verifierDone = candidateVerifier?.wait(stop: stop) ?? true
+            if stop.isStopRequested() {
+                submission?.flushJournal()
+            } else {
+                let submissionsDone = submission?.waitForPendingSubmissions(stop: stop) ?? true
+                if !verifierDone || !submissionsDone {
+                    submission?.flushJournal()
+                }
+            }
         }
 
         if !stopRequested, topN > 0, resolvedBackendFinal != .cpu {

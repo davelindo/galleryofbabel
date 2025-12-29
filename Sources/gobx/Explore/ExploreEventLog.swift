@@ -1,6 +1,6 @@
 import Foundation
 
-enum ExploreEventKind: String, Sendable {
+public enum ExploreEventKind: String, Sendable {
     case info
     case warning
     case best
@@ -9,13 +9,13 @@ enum ExploreEventKind: String, Sendable {
     case error
 }
 
-struct ExploreEvent: Sendable {
-    let time: Date
-    let kind: ExploreEventKind
-    let message: String
+public struct ExploreEvent: Sendable {
+    public let time: Date
+    public let kind: ExploreEventKind
+    public let message: String
 }
 
-final class ExploreEventLog: @unchecked Sendable {
+public final class ExploreEventLog: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [ExploreEvent] = []
     private let capacity: Int
@@ -25,7 +25,7 @@ final class ExploreEventLog: @unchecked Sendable {
         events.reserveCapacity(min(self.capacity, 512))
     }
 
-    func append(_ kind: ExploreEventKind, _ message: String) {
+    public func append(_ kind: ExploreEventKind, _ message: String) {
         lock.withLock {
             events.append(ExploreEvent(time: Date(), kind: kind, message: message))
             if events.count > capacity {
@@ -34,7 +34,7 @@ final class ExploreEventLog: @unchecked Sendable {
         }
     }
 
-    func updateLast(kind: ExploreEventKind, from oldMessage: String, to newMessage: String) -> Bool {
+    public func updateLast(kind: ExploreEventKind, from oldMessage: String, to newMessage: String) -> Bool {
         lock.withLock {
             guard let last = events.last, last.kind == kind, last.message == oldMessage else { return false }
             events[events.count - 1] = ExploreEvent(time: last.time, kind: kind, message: newMessage)
@@ -42,10 +42,23 @@ final class ExploreEventLog: @unchecked Sendable {
         }
     }
 
-    func snapshot(limit: Int) -> [ExploreEvent] {
+    public func snapshot(limit: Int) -> [ExploreEvent] {
         lock.withLock {
             let n = min(Swift.max(0, limit), events.count)
             return n == 0 ? [] : Array(events.suffix(n))
+        }
+    }
+
+    public func count() -> Int {
+        lock.withLock { events.count }
+    }
+
+    public func snapshot(from start: Int, limit: Int) -> [ExploreEvent] {
+        lock.withLock {
+            let clampedStart = max(0, min(start, events.count))
+            let clampedEnd = min(events.count, clampedStart + max(0, limit))
+            guard clampedStart < clampedEnd else { return [] }
+            return Array(events[clampedStart..<clampedEnd])
         }
     }
 }

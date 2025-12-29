@@ -4,6 +4,7 @@
 .swiftpm-config/
 .swiftpm-security/
 bin/
+dist/
 .DS_Store
 .gallery-of-babel.json
 experiments/

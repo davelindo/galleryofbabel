@@ -4,6 +4,10 @@
 
 It is a native Swift application built for Apple Silicon, using a dual-backend architecture to maximize throughput while maintaining scoring precision. It achieves state-of-the-art search speeds by using a custom fused Metal compute kernel to approximate image statistics without performing a full FFT on the GPU.
 
+## Preview
+
+[![Menubar intro](assets/menubar-intro.png)](assets/menubar-intro.mp4)
+
 ## Features
 
 *   **Hybrid Search Architecture**
@@ -12,12 +16,16 @@ It is a native Swift application built for Apple Silicon, using a dual-backend a
 *   **Adaptive Tuning**
     *   **Batch & Inflight:** Automatically adjusts batch sizes and command buffer saturation to maximize GPU utilization.
     *   **Dynamic Margins/Shift:** Continuously tunes the GPU/CPU scoring margin to balance false positives vs false negatives.
+*   **Power Management**
+    *   **GPU Profiles:** Configurable thermal profiles (`--gpu-profile`) to balance throughput against system heat and power usage (e.g., "dabbling" for light use, "heater" for max performance).
 *   **Resilience**
     *   **Memory Guards:** Monitors `phys_footprint` and stops before hitting macOS memory limits (Jetsam).
-    *   **State Management:** Journaled progress tracking (`gobx-seed-state.json`) allows pausing and resuming without re-scanning seeds.
-*   **Live Dashboard:** Interactive, htop-style terminal UI showing real-time throughput and tuning metrics.
-*   **Automated Submission:** Automatically submits qualifying seeds to the Gallery of Babel API.
-*   **Optional Stats:** Opt-in, anonymized performance metrics (every 60s and at exit).
+    *   **State Management:** Journaled progress tracking allows pausing and resuming without re-scanning seeds.
+*   **Advanced Live Dashboard**
+    *   **Interactive TUI:** A multi-page terminal interface (switch between Dashboard, Stats, Events, and Submissions).
+    *   **Visualizations:** Sparklines for throughput, history charts for scores/rates, and detailed system metrics (GPU Memory/Util, RSS).
+*   **Automated Submission:** Automatically submits qualifying seeds to the Gallery of Babel API with retry logic and rate-limit handling.
+*   **Optional Stats:** Opt-in, anonymized performance metrics.
 
 ## Performance
 
@@ -38,54 +46,79 @@ This approach reached the #1 spot on the Gallery of Babel leaderboard.
 
 *   **OS:** macOS 14.0+ (Sonoma or Sequoia).
 *   **Hardware:** Apple Silicon (M1/M2/M3/M4/M5) strongly recommended.
-*   **Build:** Swift 6.0+.
-*   **Tooling:** Xcode Command Line Tools (or full Xcode) for Swift/SwiftPM (`xcode-select --install`).
 
 ## Installation
 
-### 1. Build from Source
+The easiest way to install **gobx** is to download the pre-built binaries from the [Releases page](https://github.com/davelindo/galleryofbabel/releases).
+
+### 1. Menubar App (GUI)
+
+1.  Download `gobx-menubar-macos-arm64.zip` from the latest release.
+2.  Unzip the file.
+3.  Drag `Gobx Menubar.app` to your **Applications** folder.
+
+### 2. CLI Tool (Terminal)
+
+1.  Download `gobx-macos-arm64.tar.gz` from the latest release.
+2.  Extract the archive:
+    ```bash
+    tar -xzf gobx-macos-arm64.tar.gz
+    ```
+3.  Move the binary to your path:
+    ```bash
+    # Keep the resource bundle alongside the binary.
+    sudo mv gobx gobx_GobxCore.bundle /usr/local/bin/
+    ```
+
+### macOS Security (Gatekeeper)
+
+Because these builds are not notarized by Apple, you may see an "App is damaged" or "Unidentified developer" warning on first launch.
+
+**To bypass this:**
+
+*   **GUI App:** Control-click (Right-click) the app in Finder, select **Open**, and click **Open** in the confirmation dialog.
+*   **CLI Tool:** Run the following command to remove the quarantine attribute:
+    ```bash
+    xattr -dr com.apple.quarantine /usr/local/bin/gobx
+    xattr -dr com.apple.quarantine /usr/local/bin/gobx_GobxCore.bundle
+    # OR for the app:
+    xattr -dr com.apple.quarantine /Applications/Gobx\ Menubar.app
+    ```
+
+---
+
+### Alternative: Build from Source
+
+If you prefer to compile it yourself:
 
 ```bash
 git clone https://github.com/davelindo/galleryofbabel.git
 cd galleryofbabel
 make build
+# Binary location: .build/release/gobx
+
+# To build the Menubar App:
+make bundle-menubar
+# App location: dist/Gobx Menubar.app
 ```
 
-The binary will be located at `.build/release/gobx`. You can copy this to your path:
+## First Run and Setup
 
-```bash
-cp .build/release/gobx /usr/local/bin/
-```
-
-If SwiftPM sandboxing is blocked on your system, add:
-
-```bash
-make build SWIFT_BUILD_FLAGS=--disable-sandbox
-```
-
-### 2. First Run and Setup
-
-Run the tool in exploration mode. It will detect a missing configuration and launch an interactive wizard to set up your profile and optional telemetry, then automatically train proxy weights and run calibration if needed.
+Run the tool in exploration mode. It will detect a missing configuration and launch an interactive wizard to set up your profile and optional telemetry, then automatically train proxy weights and run calibration.
 
 ```bash
 gobx explore
 ```
 
-By default, `gobx explore` runs endlessly until you stop it. Use `--count` for a finite run.
-
-Example wizard run:
-
+Example setup wizard:
 ```text
-No config found at /Users/you/.config/gallery-of-babel/config.json. Run first-time setup now? [Y/n]
-Configure submission profile now? [Y/n]
-Profile id [user_abcd1234_xyz987654]:
-Display name [Cosmic-Explorer-AB12]:
-X handle (optional, without @):
+No config found. Run first-time setup now? [Y/n]
+Profile id [user_...]:
+Display name:
+X handle (optional):
 Share anonymized performance stats? [y/N]
-Write config to /Users/you/.config/gallery-of-babel/config.json? [Y/n]
-Wrote config to /Users/you/.config/gallery-of-babel/config.json
-Training proxy weights (first-time setup)...
-Running Metal calibration (first-time setup)...
+Training proxy weights...
+Running Metal calibration...
 ```
 
 ## Configuration
@@ -96,8 +129,8 @@ Configuration is stored in `~/.config/gallery-of-babel/config.json`.
 {
   "profile": {
     "id": "user_...",
-    "name": "YourDisplayname",
-    "xProfile": "yourhandle"
+    "name": "YourName",
+    "xProfile": "handle"
   },
   "stats": {
     "enabled": false,
@@ -106,28 +139,43 @@ Configuration is stored in `~/.config/gallery-of-babel/config.json`.
 }
 ```
 
-*   **Profile:** Used for leaderboard submissions.
-*   **Stats:** Optional opt-in for anonymized performance telemetry.
-
 ## Usage
 
 ### Exploration (Mining)
 The primary mode is `explore`. It defaults to using the Metal backend with adaptive batching.
 
 ```bash
-# Run indefinitely (Ctrl+C to stop)
+# Run indefinitely with default settings
 gobx explore
 
-# Run for a specific number of seeds
+# Run for a specific count
 gobx explore --count 10000000
+
+# Run with a specific thermal profile
+gobx explore --gpu-profile dabbling
 ```
 
+**GPU Profiles (`--gpu-profile`):**
+*   `dabbling`: Low usage, keeps system cool (~20-30% load).
+*   `interested`: Moderate usage, balanced.
+*   `lets-go`: High usage.
+*   `heater`: Unrestricted (Default). Max throughput, high power consumption.
+
 **Common Flags:**
-*   `--endless`: Explicitly run forever (default if count is omitted).
+*   `--endless`: Explicitly run forever.
 *   `--no-ui`: Disable the dashboard (useful for logging to files).
 *   `--report-every <sec>`: Status line cadence in non-UI mode.
-*   `--start <seed>`: Start from a specific seed and reset state.
-*   `--setup`: Run the interactive setup without exiting `explore`.
+*   `--start <seed>`: Start from a specific seed.
+*   `--setup`: Rerun the interactive setup.
+*   `--no-submit`: Disable submissions (useful for testing or offline runs).
+
+### Interactive Dashboard Controls
+When running `gobx explore` in a terminal:
+*   `1` `2` `3` `4`: Switch tabs (Dashboard, Stats, Events, Submissions).
+*   `Tab` / `Shift+Tab`: Cycle tabs.
+*   `?`: Toggle help overlay.
+*   **Stats Tab:** Use `Left`/`Right` arrows to pan through history.
+*   **Logs Tabs:** Use `Up`/`Down`/`PgUp`/`PgDn` to scroll logs.
 
 ### Benchmarking
 Measure raw throughput without verification overhead.
@@ -135,20 +183,12 @@ Measure raw throughput without verification overhead.
 ```bash
 # Sweep common batch sizes
 gobx bench-metal
-
-# Benchmark specific parameters
-gobx bench-metal --size 128 --tg 192 --batches 256,512 --seconds 10
 ```
 
-### Calibration
-The Metal proxy provides an approximation of the score. Calibration scans random seeds to determine the statistical error margin between the GPU and CPU scorers, ensuring you do not miss high-scoring seeds.
-
-```bash
-gobx calibrate-metal
-gobx calibrate-metal --force
-```
-
-*Note: `gobx explore` loads these calibration values automatically and runs calibration on first run when needed.*
+### Calibration & Training
+The Metal proxy requires calibration to map approximate GPU scores to real CPU scores.
+*   `gobx calibrate-metal`: Scans random seeds to determine error margins.
+*   `gobx train-proxy`: Retrains the linear weights used by the GPU kernel.
 
 ### Verification
 Check the exact score of a specific seed using the CPU reference implementation.
@@ -157,27 +197,12 @@ Check the exact score of a specific seed using the CPU reference implementation.
 gobx score 123456789
 ```
 
-### Proxy Training and Logs
-Train proxy weights either from fresh CPU samples or from a `proxy-log` capture.
-
-```bash
-# Self-contained training (generates its own CPU samples)
-gobx train-proxy
-
-# Capture training data (features + CPU scores)
-gobx proxy-log --n 500000
-
-# Train from the proxy-log output
-gobx train-proxy-log
-```
-
 ### Stats Dashboard
 
-The hosted stats service publishes PNGs generated by the `/stats` dashboard. These visuals reflect **only opt-in** runs (users must explicitly enable stats collection), so they are not comprehensive of all gobx usage.
+The hosted stats service publishes PNGs generated by the `/stats` dashboard. These visuals reflect **only opt-in** runs.
 
 ![Estimated total rate](https://gobx-stats.davelindon.me/stats/assets/total_rate.png)
 ![Performance over time](https://gobx-stats.davelindon.me/stats/assets/perf_over_time.png)
-![Performance by version](https://gobx-stats.davelindon.me/stats/assets/perf_by_version.png)
 
 ## Architecture details
 
@@ -200,5 +225,5 @@ Candidates passing the GPU threshold are sent to the CPU for exact scoring.
 ## Troubleshooting
 
 *   **"No valid Metal calibration found"**: Run `gobx calibrate-metal`.
-*   **Jetsam / Out of Memory**: Reduce other GPU/CPU load and restart; gobx attempts to exit before hitting system limits.
-*   **Crashes**: The tool includes a crash reporter that prints backtraces on SIGSEGV/SIGBUS. Set `GOBX_NO_CRASH_REPORTER=1` to disable it.
+*   **Jetsam / Out of Memory**: The app attempts to exit before hitting limits, but you can try reducing batch sizes or closing other apps.
+*   **Crashes**: A crash reporter prints backtraces on SIGSEGV/SIGBUS. Set `GOBX_NO_CRASH_REPORTER=1` to disable it.

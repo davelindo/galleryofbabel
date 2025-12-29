@@ -1,6 +1,6 @@
 import Foundation
 
-struct ExploreOptions {
+public struct ExploreOptions {
     var count: Int? = nil
     var endlessFlag: Bool = false
 
@@ -21,11 +21,11 @@ struct ExploreOptions {
     var topUniqueUsers: Bool = false
     var topUniqueUsersSpecified: Bool = false
     var refreshEverySec: Double = 180.0
-    var reportEverySec: Double = 1.0
-    var uiEnabled: Bool? = nil
+    public var reportEverySec: Double = 1.0
+    public var uiEnabled: Bool? = nil
     var setupConfig: Bool = false
-    var statsEnabled: Bool? = nil
-    var statsUrl: String? = nil
+    public var statsEnabled: Bool? = nil
+    public var statsUrl: String? = nil
     var memGuardMaxGB: Double = 0.0
     var memGuardMaxFrac: Double = 0.0
     var memGuardMaxGBSpecified: Bool = false
@@ -58,12 +58,15 @@ struct ExploreOptions {
     var mpsBatchMinSpecified: Bool = false
     var mpsBatchMaxSpecified: Bool = false
     var mpsBatchTuneEverySec: Double = 2.0
+    public var gpuThroughputProfile: GPUThroughputProfile = .heater
 
     var endless: Bool { endlessFlag || count == nil }
+
+    public init() {}
 }
 
 extension ExploreOptions {
-    static func parse(args: [String]) throws -> ExploreOptions {
+    public static func parse(args: [String]) throws -> ExploreOptions {
         var parser = ArgumentParser(args: args, usage: gobxHelpText)
         var o = ExploreOptions()
 
@@ -79,6 +82,18 @@ extension ExploreOptions {
                 o.seedMode = .state
             case "--report-every":
                 o.reportEverySec = try parser.requireDouble(for: "--report-every")
+            case "--gpu-profile":
+                let raw = try parser.requireValue(for: "--gpu-profile")
+                guard let profile = GPUThroughputProfile.parse(raw) else {
+                    throw GobxError.usage("Invalid --gpu-profile: \(raw) (use dabbling|interested|lets-go|heater)")
+                }
+                o.gpuThroughputProfile = profile
+            case "--submit":
+                o.doSubmit = true
+                o.doSubmitSpecified = true
+            case "--no-submit":
+                o.doSubmit = false
+                o.doSubmitSpecified = true
             case "--ui":
                 o.uiEnabled = true
             case "--no-ui":
