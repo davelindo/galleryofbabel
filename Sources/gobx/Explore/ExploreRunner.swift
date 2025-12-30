@@ -106,6 +106,22 @@ public enum ExploreRunner {
             }
         }
 
+        func fetchTopWithRetry(limit: Int, config: AppConfig, uniqueUsers: Bool, attempts: Int = 3) async -> TopResponse? {
+            let delays: [TimeInterval] = [1.0, 2.5, 5.0]
+            for attempt in 1...max(1, attempts) {
+                if stop.isStopRequested() { return nil }
+                if let top = await fetchTop(limit: limit, config: config, uniqueUsers: uniqueUsers) {
+                    return top
+                }
+                guard attempt < attempts else { break }
+                let delay = delays[min(attempt - 1, delays.count - 1)]
+                emit(.warning, "Warning: failed to fetch top 500 (attempt \(attempt)/\(attempts)); retrying in \(String(format: "%.1f", delay))s")
+                let ns = UInt64((delay * 1_000_000_000).rounded(.up))
+                try? await Task.sleep(nanoseconds: ns)
+            }
+            return nil
+        }
+
         let cpuFlushIntervalNs: UInt64 = {
             guard endless else { return 0 }
             let sec = min(1.0, max(0.25, uiRefreshEverySec / 2.0))
@@ -360,9 +376,12 @@ public enum ExploreRunner {
 
         var seedAllocator: SeedRangeAllocator? = nil
         var seedStateTimer: DispatchSourceTimer? = nil
+        var seedStateURL: URL? = nil
+        var seedStateWriteQueue: DispatchQueue? = nil
 
         if seedMode == .state {
             let url = URL(fileURLWithPath: GobxPaths.expandPath(statePath ?? GobxPaths.seedStateURL.path))
+            seedStateURL = url
 
             var state: SeedExploreState
             if !stateReset, let loaded = loadSeedState(from: url) {
@@ -397,6 +416,7 @@ public enum ExploreRunner {
 
             let interval = max(1.0, stateWriteEverySec)
             let writeQueue = DispatchQueue(label: "gobx.seedstate", qos: .utility)
+            seedStateWriteQueue = writeQueue
             let allocForTimer = seedAllocator
             let timer = DispatchSource.makeTimerSource(queue: writeQueue)
             timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(1))
@@ -518,8 +538,9 @@ public enum ExploreRunner {
             if topUniqueUsers {
                 emit(.info, "Using unique-user top list for thresholds")
             }
-            if let top = await fetchTop(limit: 500, config: configForSubmit, uniqueUsers: topUniqueUsers) {
-                state.mergeTop(top)
+            let primaryUnique = topUniqueUsers
+            if let top = await fetchTopWithRetry(limit: 500, config: configForSubmit, uniqueUsers: primaryUnique) {
+                state.mergeTop(top, uniqueUsers: primaryUnique, isPrimary: true)
                 let snap = state.snapshot()
                 if !minScoreSpecified, snap.top500Threshold.isFinite {
                     emit(.info, "Calibrated min-score from \(minScore) to \(snap.top500Threshold) (Rank #\(top.images.count))")
@@ -528,6 +549,14 @@ public enum ExploreRunner {
                 emit(.info, "Cached \(snap.knownCount) known seeds. Top500 threshold=\(String(format: "%.6f", snap.top500Threshold))")
             } else {
                 emit(.warning, "Warning: failed to fetch top 500; submissions may be rejected until refresh succeeds")
+            }
+
+            let altUnique = !primaryUnique
+            if let altTop = await fetchTopWithRetry(limit: 500, config: configForSubmit, uniqueUsers: altUnique, attempts: 2) {
+                state.mergeTop(altTop, uniqueUsers: altUnique, isPrimary: false)
+            } else {
+                let label = altUnique ? "unique" : "all"
+                emit(.warning, "Warning: failed to fetch top 500 (\(label)); reference markers may be missing")
             }
 
             if let p = configForSubmit.profile {
@@ -910,6 +939,23 @@ public enum ExploreRunner {
         reportTimer?.cancel()
         seedStateTimer?.cancel()
         memGuardTimer?.cancel()
+
+        if let url = seedStateURL, let allocator = seedAllocator {
+            let saveFinal = {
+                guard let snap = allocator.snapshotForSave() else { return }
+                do {
+                    try saveSeedState(snap, to: url)
+                    allocator.markSaved(nextIndex: snap.nextIndex)
+                } catch {
+                    emit(.warning, "Warning: failed to write seed state to \(url.path): \(error)")
+                }
+            }
+            if let writeQueue = seedStateWriteQueue {
+                writeQueue.sync(execute: saveFinal)
+            } else {
+                saveFinal()
+            }
+        }
 
         let stopRequested = stop.isStopRequested()
         if stopRequested {

@@ -238,10 +238,15 @@ public final class ApproxBestTracker: @unchecked Sendable {
 public final class SubmissionState: @unchecked Sendable {
     public struct Snapshot {
         public let top500Threshold: Double
+        public let top500UniqueThreshold: Double
+        public let top500AllThreshold: Double
         public let lastRefresh: Date
+        public let lastRefreshAll: Date
         public let knownCount: Int
         public let topBestScore: Double?
         public let topBestSeed: UInt64?
+        public let topBestAllScore: Double?
+        public let topBestAllSeed: UInt64?
         public let personalBestScore: Double?
         public let personalBestSeed: UInt64?
         public let personalBestRank: Int?
@@ -255,9 +260,14 @@ public final class SubmissionState: @unchecked Sendable {
     private let acceptedCap: Int = 4096
     private var topScores: [Double] = []
     private var top500Threshold: Double = -Double.infinity
+    private var top500UniqueThreshold: Double = -Double.infinity
+    private var top500AllThreshold: Double = -Double.infinity
     private var lastRefresh: Date = .distantPast
+    private var lastRefreshAll: Date = .distantPast
     private var topBestScore: Double? = nil
     private var topBestSeed: UInt64? = nil
+    private var topBestAllScore: Double? = nil
+    private var topBestAllSeed: UInt64? = nil
     private var personalBestScore: Double? = nil
     private var personalBestSeed: UInt64? = nil
     private var personalBestRank: Int? = nil
@@ -266,52 +276,64 @@ public final class SubmissionState: @unchecked Sendable {
         self.profileId = profileId
     }
 
-    func mergeTop(_ top: TopResponse) {
+    func mergeTop(_ top: TopResponse, uniqueUsers: Bool, isPrimary: Bool) {
+        let scores = top.images.map { $0.score }
+        let sortedScores = scores.sorted(by: >)
+        let threshold = sortedScores.last ?? -Double.infinity
+        let best = top.images.max(by: { $0.score < $1.score })
+        let now = Date()
+
         lock.lock()
-        topScores = top.images.map { $0.score }.sorted(by: >)
-        topSeeds.removeAll(keepingCapacity: true)
-        topSeeds.reserveCapacity(top.images.count)
-        for img in top.images { topSeeds.insert(img.seed) }
-        if let best = top.images.max(by: { $0.score < $1.score }) {
-            topBestScore = best.score
-            topBestSeed = best.seed
+        if uniqueUsers {
+            top500UniqueThreshold = threshold
         } else {
-            topBestScore = nil
-            topBestSeed = nil
+            top500AllThreshold = threshold
+            topBestAllScore = best?.score
+            topBestAllSeed = best?.seed
+            lastRefreshAll = now
         }
-        if let profileId, !profileId.isEmpty {
-            if let personal = top.images.filter({ $0.discovererId == profileId }).max(by: { $0.score < $1.score }) {
-                personalBestScore = personal.score
-                personalBestSeed = personal.seed
-                if let rank = personal.rank {
-                    personalBestRank = rank
-                } else {
-                    let sorted = top.images.sorted {
-                        if $0.score == $1.score {
-                            return ($0.rank ?? Int.max) < ($1.rank ?? Int.max)
-                        }
-                        return $0.score > $1.score
-                    }
-                    if let idx = sorted.firstIndex(where: { $0.seed == personal.seed }) {
-                        personalBestRank = idx + 1
+
+        if isPrimary {
+            topScores = sortedScores
+            topSeeds.removeAll(keepingCapacity: true)
+            topSeeds.reserveCapacity(top.images.count)
+            for img in top.images { topSeeds.insert(img.seed) }
+            topBestScore = best?.score
+            topBestSeed = best?.seed
+            if let profileId, !profileId.isEmpty {
+                if let personal = top.images.filter({ $0.discovererId == profileId }).max(by: { $0.score < $1.score }) {
+                    personalBestScore = personal.score
+                    personalBestSeed = personal.seed
+                    if let rank = personal.rank {
+                        personalBestRank = rank
                     } else {
-                        personalBestRank = nil
+                        let sorted = top.images.sorted {
+                            if $0.score == $1.score {
+                                return ($0.rank ?? Int.max) < ($1.rank ?? Int.max)
+                            }
+                            return $0.score > $1.score
+                        }
+                        if let idx = sorted.firstIndex(where: { $0.seed == personal.seed }) {
+                            personalBestRank = idx + 1
+                        } else {
+                            personalBestRank = nil
+                        }
                     }
+                } else {
+                    personalBestScore = nil
+                    personalBestSeed = nil
+                    personalBestRank = nil
                 }
             } else {
                 personalBestScore = nil
                 personalBestSeed = nil
                 personalBestRank = nil
             }
-        } else {
-            personalBestScore = nil
-            personalBestSeed = nil
-            personalBestRank = nil
+            if let last = topScores.last {
+                top500Threshold = last
+            }
+            lastRefresh = now
         }
-        if let last = topScores.last {
-            top500Threshold = last
-        }
-        lastRefresh = Date()
         lock.unlock()
     }
 
@@ -389,10 +411,15 @@ public final class SubmissionState: @unchecked Sendable {
         }
         let s = Snapshot(
             top500Threshold: top500Threshold,
+            top500UniqueThreshold: top500UniqueThreshold,
+            top500AllThreshold: top500AllThreshold,
             lastRefresh: lastRefresh,
+            lastRefreshAll: lastRefreshAll,
             knownCount: knownCount,
             topBestScore: topBestScore,
             topBestSeed: topBestSeed,
+            topBestAllScore: topBestAllScore,
+            topBestAllSeed: topBestAllSeed,
             personalBestScore: personalBestScore,
             personalBestSeed: personalBestSeed,
             personalBestRank: personalBestRank
@@ -594,6 +621,8 @@ public final class SubmissionManager: @unchecked Sendable {
     private let retryBaseSec: TimeInterval = 1.0
     private let retryMaxSec: TimeInterval = 30.0
     private let retryJitter: Double = 0.2
+    private let refreshBaseSec: TimeInterval = 5.0
+    private let refreshMaxSec: TimeInterval = 300.0
     private let statsLock = NSLock()
     private var submitAttempts: UInt64 = 0
     private var acceptedCount: UInt64 = 0
@@ -620,6 +649,12 @@ public final class SubmissionManager: @unchecked Sendable {
     private let submissionLog = SubmissionLog(capacity: 2000)
     private var lastRateLimitSeed: UInt64? = nil
     private var lastRateLimitMessage: String? = nil
+    private var refreshInFlight = false
+    private var refreshFailures = 0
+    private var refreshBackoffUntil: TimeInterval = 0.0
+    private var refreshAltInFlight = false
+    private var refreshAltFailures = 0
+    private var refreshAltBackoffUntil: TimeInterval = 0.0
 
     init(
         config: AppConfig,
@@ -699,6 +734,12 @@ public final class SubmissionManager: @unchecked Sendable {
         let delay = min(retryMaxSec, raw)
         let jitter = delay * retryJitter * Double.random(in: -1.0...1.0)
         return max(0.0, delay + jitter)
+    }
+
+    private func refreshDelay(attempt: Int) -> TimeInterval {
+        let step = max(1, attempt)
+        let raw = refreshBaseSec * pow(2.0, Double(step - 1))
+        return min(refreshMaxSec, raw)
     }
 
     public func effectiveThreshold() -> Double {
@@ -824,18 +865,57 @@ public final class SubmissionManager: @unchecked Sendable {
 
     func enqueueRefreshTop500(limit: Int = 500, reason: String? = nil) {
         queue.async {
+            let now = Date().timeIntervalSinceReferenceDate
+            guard !self.refreshInFlight else { return }
+            guard self.refreshBackoffUntil <= now else { return }
+            self.refreshInFlight = true
+            let reasonNote = reason.map { " (\($0))" } ?? ""
+            let primaryUnique = self.topUniqueUsers
             Task {
-                guard let top = await fetchTop(limit: limit, config: self.config, uniqueUsers: self.topUniqueUsers) else { return }
-                self.state.mergeTop(top)
+                let top = await fetchTop(limit: limit, config: self.config, uniqueUsers: primaryUnique)
                 self.queue.async {
-                    self.maybeLoadSubmissionJournal()
-                    let snap = self.state.snapshot()
-                    let threshold = max(self.userMinScore, snap.top500Threshold)
-                    self.pruneQueueLocked(threshold: threshold)
+                    self.refreshInFlight = false
+                    if let top {
+                        self.refreshFailures = 0
+                        self.refreshBackoffUntil = 0.0
+                        self.state.mergeTop(top, uniqueUsers: primaryUnique, isPrimary: true)
+                        self.maybeLoadSubmissionJournal()
+                        let snap = self.state.snapshot()
+                        let threshold = max(self.userMinScore, snap.top500Threshold)
+                        self.pruneQueueLocked(threshold: threshold)
+                        self.emit(.info, "Refreshed top \(limit) threshold=\(String(format: "%.6f", snap.top500Threshold)) known=\(snap.knownCount)\(reasonNote)")
+                    } else {
+                        self.refreshFailures += 1
+                        let delay = self.refreshDelay(attempt: self.refreshFailures)
+                        let delayStr = String(format: "%.1f", delay)
+                        self.refreshBackoffUntil = Date().timeIntervalSinceReferenceDate + delay
+                        self.emit(.warning, "Warning: failed to refresh top \(limit)\(reasonNote); retrying in \(delayStr)s")
+                    }
                 }
-                let snap = self.state.snapshot()
-                let why = reason.map { " (\($0))" } ?? ""
-                self.emit(.info, "Refreshed top \(limit) threshold=\(String(format: "%.6f", snap.top500Threshold)) known=\(snap.knownCount)\(why)")
+            }
+
+            let altNow = Date().timeIntervalSinceReferenceDate
+            guard !self.refreshAltInFlight else { return }
+            guard self.refreshAltBackoffUntil <= altNow else { return }
+            self.refreshAltInFlight = true
+            let altUnique = !primaryUnique
+            let altLabel = altUnique ? "unique" : "all"
+            Task {
+                let top = await fetchTop(limit: limit, config: self.config, uniqueUsers: altUnique)
+                self.queue.async {
+                    self.refreshAltInFlight = false
+                    if let top {
+                        self.refreshAltFailures = 0
+                        self.refreshAltBackoffUntil = 0.0
+                        self.state.mergeTop(top, uniqueUsers: altUnique, isPrimary: false)
+                    } else {
+                        self.refreshAltFailures += 1
+                        let delay = self.refreshDelay(attempt: self.refreshAltFailures)
+                        let delayStr = String(format: "%.1f", delay)
+                        self.refreshAltBackoffUntil = Date().timeIntervalSinceReferenceDate + delay
+                        self.emit(.warning, "Warning: failed to refresh top \(limit) (\(altLabel))\(reasonNote); retrying in \(delayStr)s")
+                    }
+                }
             }
         }
     }
