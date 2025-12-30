@@ -46,10 +46,12 @@ chmod +x "$MACOS_DIR/$BIN_NAME"
 bundle_found=0
 if [[ -d "$RESOURCE_BUNDLE_PATH" ]]; then
   cp -R "$RESOURCE_BUNDLE_PATH" "$RESOURCES_DIR/"
+  cp -R "$RESOURCE_BUNDLE_PATH" "$APP_DIR/"
   bundle_found=1
 fi
 if [[ -d "$ALT_RESOURCE_BUNDLE_PATH" ]]; then
   cp -R "$ALT_RESOURCE_BUNDLE_PATH" "$RESOURCES_DIR/"
+  cp -R "$ALT_RESOURCE_BUNDLE_PATH" "$APP_DIR/"
   bundle_found=1
 fi
 if [[ "$bundle_found" != "1" ]]; then
