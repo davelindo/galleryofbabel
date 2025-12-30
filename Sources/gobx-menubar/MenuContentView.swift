@@ -1345,7 +1345,7 @@ struct SetupWizardView: View {
     var body: some View {
         ZStack {
             Rectangle()
-                .fill(Color.black.opacity(0.55))
+                .fill(AppTheme.setupBackdrop)
                 .ignoresSafeArea()
 
             GlassCard(title: "First-time setup", icon: "wand.and.stars") {
@@ -1405,6 +1405,14 @@ struct SetupWizardView: View {
                 .padding(16)
             }
             .frame(maxWidth: 360)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(AppTheme.setupCardFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(AppTheme.setupCardStroke, lineWidth: 1)
+            )
         }
         .transition(.opacity)
     }
@@ -1539,6 +1547,9 @@ struct AppTheme {
             dark: .clear
         )
     }
+    static var setupBackdrop: Color { Color.black.opacity(0.78) }
+    static var setupCardFill: Color { Color(nsColor: .windowBackgroundColor).opacity(0.96) }
+    static var setupCardStroke: Color { Color(nsColor: .separatorColor).opacity(0.6) }
 
     private static func dynamicColor(light: NSColor, dark: NSColor) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
