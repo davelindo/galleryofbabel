@@ -6,7 +6,12 @@ It is a native Swift application built for Apple Silicon, using a dual-backend a
 
 ## Preview
 
-[![Menubar intro](assets/menubar-intro.png)](assets/menubar-intro.mp4)
+<table>
+  <tr>
+    <td><img src="assets/UI-1.png" alt="Menubar dashboard" width="100%"></td>
+    <td><img src="assets/UI-2.png" alt="Menubar stats" width="100%"></td>
+  </tr>
+</table>
 
 ## Features
 
