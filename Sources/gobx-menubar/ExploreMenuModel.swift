@@ -122,11 +122,15 @@ struct MenuSummary {
     let bestSource: String?
     let topBestScore: Double?
     let topBestSeed: UInt64?
+    let topBestAllScore: Double?
+    let topBestAllSeed: UInt64?
     let personalBestPreviousScore: Double?
     let personalBestPreviousSeed: UInt64?
     let personalBestPreviousRank: Int?
     let threshold: Double
     let top500: Double?
+    let top500Unique: Double?
+    let top500All: Double?
     let margin: Double
     let shift: Double
     let submitStats: SubmissionManager.StatsSnapshot?
@@ -150,11 +154,15 @@ struct MenuSummary {
         bestSource: nil,
         topBestScore: nil,
         topBestSeed: nil,
+        topBestAllScore: nil,
+        topBestAllSeed: nil,
         personalBestPreviousScore: nil,
         personalBestPreviousSeed: nil,
         personalBestPreviousRank: nil,
         threshold: 0,
         top500: nil,
+        top500Unique: nil,
+        top500All: nil,
         margin: 0,
         shift: 0,
         submitStats: nil,
@@ -183,6 +191,7 @@ struct HistoryPoint: Identifiable {
     let mpsAvg: Double?
     let cpuVerifyAvg: Double?
     let submitRate: Double?
+    let submitMisses: UInt64
     let rssBytes: UInt64?
     let gpuMemBytes: UInt64?
     let gpuUtilPercent: Double?
@@ -233,7 +242,7 @@ final class ExploreMenuModel: ObservableObject {
     private var refreshTick: Int = 0
     private var totalCountDisplay: UInt64 = 0
 
-    private let historyCapacity = 600
+    private let historyCapacity = 3600
     private var desiredProfile: GPUThroughputProfile = .heater
     private var runToken: UInt64 = 0
 
@@ -439,19 +448,52 @@ final class ExploreMenuModel: ObservableObject {
             if approxSnap.score.isFinite { return approxSnap.seed }
             return nil
         }()
+
         let bestSource: String? = bestSnap.source
 
         let submitSnap = bridge.submission()?.statsSnapshot()
+        var submitMisses: UInt64 = 0
         let submitRate: Double? = {
             guard let submitSnap else { return nil }
             let prior = lastSubmitSnap
-            let submitDelta = prior.map { Double(submitSnap.submitAttempts &- $0.submitAttempts) } ?? 0.0
+            let submitDelta: Double = {
+                guard let prior else { return 0.0 }
+                if submitSnap.submitAttempts >= prior.submitAttempts {
+                    return Double(submitSnap.submitAttempts - prior.submitAttempts)
+                }
+                return 0.0
+            }()
+            let rejectedDelta: UInt64 = {
+                guard let prior else { return 0 }
+                if submitSnap.rejectedCount >= prior.rejectedCount {
+                    return submitSnap.rejectedCount - prior.rejectedCount
+                }
+                return 0
+            }()
+            let failedDelta: UInt64 = {
+                guard let prior else { return 0 }
+                if submitSnap.failedCount >= prior.failedCount {
+                    return submitSnap.failedCount - prior.failedCount
+                }
+                return 0
+            }()
+            submitMisses = rejectedDelta + failedDelta
             lastSubmitSnap = submitSnap
             return dt > 0 ? submitDelta / dt : 0.0
         }()
 
         let topSnap = bridge.submission()?.stateSnapshot()
         let top500 = topSnap?.top500Threshold
+        let top500Unique: Double? = {
+            let v = topSnap?.top500UniqueThreshold ?? .nan
+            return v.isFinite ? v : nil
+        }()
+        let top500All: Double? = {
+            let v = topSnap?.top500AllThreshold ?? .nan
+            return v.isFinite ? v : nil
+        }()
+        let topBestAllScore = topSnap?.topBestAllScore
+        let topBestAllSeed = topSnap?.topBestAllSeed
         let threshold = bridge.submission()?.effectiveThreshold() ?? context.minScore
 
         let systemSnap = systemStats.snapshot()
@@ -478,11 +520,15 @@ final class ExploreMenuModel: ObservableObject {
             bestSource: bestSource,
             topBestScore: topSnap?.topBestScore,
             topBestSeed: topSnap?.topBestSeed,
+            topBestAllScore: topBestAllScore,
+            topBestAllSeed: topBestAllSeed,
             personalBestPreviousScore: topSnap?.personalBestScore,
             personalBestPreviousSeed: topSnap?.personalBestSeed,
             personalBestPreviousRank: topSnap?.personalBestRank,
             threshold: threshold,
             top500: top500,
+            top500Unique: top500Unique,
+            top500All: top500All,
             margin: context.mpsVerifyMargin.current(),
             shift: context.mpsScoreShift.current(),
             submitStats: submitSnap,
@@ -513,6 +559,7 @@ final class ExploreMenuModel: ObservableObject {
             mpsAvg: mpsAvg,
             cpuVerifyAvg: cpuVerifyAvg,
             submitRate: submitRate,
+            submitMisses: submitMisses,
             rssBytes: systemSnap.processResidentBytes,
             gpuMemBytes: systemSnap.gpuAllocatedBytes,
             gpuUtilPercent: systemSnap.gpuUtilPercent,

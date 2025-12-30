@@ -2,6 +2,8 @@ import Foundation
 @preconcurrency import Darwin
 @preconcurrency import IOKit
 
+private let machTaskSelf: mach_port_t = mach_task_self_
+
 public struct SystemPowerSnapshot: Sendable {
     public let available: Bool
     public let systemInWatts: Double?
@@ -39,12 +41,13 @@ public struct SystemPowerSnapshot: Sendable {
 final class SystemPowerReader: @unchecked Sendable {
     private let ioReader = IORegistryReader()
     private let smcReader = SMCReader()
+    private let hidTemperatureReader = HIDTemperatureReader()
     private let lock = NSLock()
     private var lastTempC: Double?
     private var lastTempStamp: TimeInterval = 0
     private let tempHoldSeconds: TimeInterval = 30
     private let minTempC: Double = 20
-    private let maxTempC: Double = 110
+    private let maxTempC: Double = 150
 
     func snapshot() -> SystemPowerSnapshot {
         lock.withLock {
@@ -73,7 +76,8 @@ final class SystemPowerReader: @unchecked Sendable {
 
             let adapterPower = systemIn.map { $0 + (efficiencyLoss ?? 0.0) }
 
-            let tempC = stabilizeTemperature(smcResult.tempAvailable ? smc.temperature : nil)
+            let smcTemp = smcResult.tempAvailable ? smc.temperature : nil
+            let tempC = stabilizeTemperature(smcTemp ?? hidTemperatureReader.readCPUTemperature())
             let available = smcPowerAvailable || tempC != nil || batteryInfo != nil
 
             return SystemPowerSnapshot(
@@ -242,7 +246,28 @@ private final class SMCReader {
         "TC0D", "TC0P", "TC0E", "TC0F",
         "Tp0p", "Tp01", "Tp05", "Tp09", "Tp0T", "Tp0H",
         "TG0D", "TG0P", "TG0E", "TG0F",
-        "TCXC"
+        "TCXC", "TB0T"
+    ]
+    private let cpuTempKeys = [
+        "Tp09", "Tp0T",
+        "Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b",
+        "Tg05", "Tg0D", "Tg0L", "Tg0T",
+        "TC10", "TC11", "TC12", "TC13",
+        "TC20", "TC21", "TC22", "TC23",
+        "TC30", "TC31", "TC32", "TC33",
+        "TC40", "TC41", "TC42", "TC43",
+        "TC50", "TC51", "TC52", "TC53",
+        "Tg04", "Tg05", "Tg0C", "Tg0D", "Tg0K", "Tg0L", "Tg0S", "Tg0T",
+        "Tp1h", "Tp1t", "Tp1p", "Tp1l",
+        "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0X", "Tp0b", "Tp0f", "Tp0j",
+        "Tg0f", "Tg0j",
+        "Te05", "Te0L", "Te0P", "Te0S",
+        "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D", "Tf0E",
+        "Tf44", "Tf49", "Tf4A", "Tf4B", "Tf4D", "Tf4E",
+        "Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A",
+        "Te05", "Te0S", "Te09", "Te0H",
+        "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0V", "Tp0Y", "Tp0b", "Tp0e",
+        "Tg0G", "Tg0H", "Tg1U", "Tg1k", "Tg0K", "Tg0L", "Tg0d", "Tg0e", "Tg0j", "Tg0k",
     ]
     private let minTempC = 20.0
     private let maxTempC = 110.0
@@ -263,6 +288,7 @@ private final class SMCReader {
         var didReadDelivery = false
         var didReadSystemTotal = false
         var didReadBatteryRate = false
+        var tempAvailable = false
 
         for key in powerKeys {
             guard let value = connection.readKey(key)?.floatValue() else { continue }
@@ -295,14 +321,23 @@ private final class SMCReader {
             }
         }
 
-        var temps: [Double] = []
-        temps.reserveCapacity(tempKeys.count)
-        for key in tempKeys {
-            guard let value = connection.readKey(key)?.floatValue() else { continue }
-            temps.append(value)
+        if let cpuTemp = readCPUTemperature(connection)?.value,
+           cpuTemp >= minTempC,
+           cpuTemp <= maxTempC {
+            data.temperature = cpuTemp
+            tempAvailable = true
         }
-        let tempAvailable = !temps.isEmpty
-        data.temperature = selectTemperature(from: temps)
+
+        if !tempAvailable {
+            var temps: [Double] = []
+            temps.reserveCapacity(tempKeys.count)
+            for key in tempKeys {
+                guard let value = connection.readKey(key)?.floatValue() else { continue }
+                temps.append(value)
+            }
+            data.temperature = selectTemperature(from: temps)
+            tempAvailable = data.temperature != nil
+        }
 
         return SMCReadResult(
             data: data,
@@ -311,6 +346,23 @@ private final class SMCReader {
             didReadBatteryRate: didReadBatteryRate,
             tempAvailable: tempAvailable
         )
+    }
+
+    private func readCPUTemperature(_ connection: SMCConnection) -> (value: Double, key: String)? {
+        var maxTemp: Double = 0
+        var maxKey: String = ""
+        var seen = Set<String>()
+
+        for key in cpuTempKeys where !seen.contains(key) {
+            seen.insert(key)
+            guard let value = connection.readKey(key)?.floatValue() else { continue }
+            if value > maxTemp, value < 150 {
+                maxTemp = value
+                maxKey = key
+            }
+        }
+
+        return maxTemp > 0 ? (maxTemp, maxKey) : nil
     }
 
     private func selectTemperature(from values: [Double]) -> Double? {
@@ -503,6 +555,120 @@ private struct SMCValue {
     }
 }
 
+private final class HIDTemperatureReader {
+    private typealias IOHIDEventSystemClientRef = OpaquePointer
+    private typealias IOHIDServiceClientRef = OpaquePointer
+    private typealias IOHIDEventRef = OpaquePointer
+
+    private typealias CreateFunc = @convention(c) (CFAllocator?) -> IOHIDEventSystemClientRef?
+    private typealias SetMatchingFunc = @convention(c) (IOHIDEventSystemClientRef, CFDictionary?) -> Void
+    private typealias CopyServicesFunc = @convention(c) (IOHIDEventSystemClientRef) -> CFArray?
+    private typealias CopyEventFunc = @convention(c) (IOHIDServiceClientRef, Int64, Int32, Int64) -> IOHIDEventRef?
+    private typealias GetFloatValueFunc = @convention(c) (IOHIDEventRef, UInt32) -> Double
+
+    private var create: CreateFunc?
+    private var setMatching: SetMatchingFunc?
+    private var copyServices: CopyServicesFunc?
+    private var copyEvent: CopyEventFunc?
+    private var getFloatValue: GetFloatValueFunc?
+    private var isInitialized = false
+    private var client: IOHIDEventSystemClientRef?
+    private var services: CFArray?
+
+    private let eventTypeTemperature: Int64 = 15
+    private let temperatureLevelField: UInt32 = 0xf0000
+
+    func readCPUTemperature() -> Double? {
+        ensureInitialized()
+
+        guard let create,
+              let setMatching,
+              let copyServices,
+              let copyEvent,
+              let getFloatValue else { return nil }
+
+        if client == nil || services == nil {
+            resetClient()
+            resetServices()
+            client = create(kCFAllocatorDefault)
+            guard let client else { return nil }
+
+            let matching: [String: Any] = ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5]
+            setMatching(client, matching as CFDictionary)
+
+            services = copyServices(client)
+        }
+
+        guard let services else { return nil }
+        let count = CFArrayGetCount(services)
+        guard count > 0 else {
+            resetServices()
+            return nil
+        }
+
+        var maxTemp: Double = 0
+        for index in 0..<count {
+            let value = CFArrayGetValueAtIndex(services, index)
+            let service = unsafeBitCast(value, to: IOHIDServiceClientRef.self)
+            guard let event = copyEvent(service, eventTypeTemperature, 0, 0) else { continue }
+            defer { releaseOpaque(event) }
+            let temp = getFloatValue(event, temperatureLevelField)
+            if temp > maxTemp && temp < 150 {
+                maxTemp = temp
+            }
+        }
+
+        return maxTemp > 0 ? maxTemp : nil
+    }
+
+    deinit {
+        resetServices()
+        resetClient()
+    }
+
+    private func ensureInitialized() {
+        guard !isInitialized else { return }
+        isInitialized = true
+
+        guard let handle = dlopen(nil, RTLD_NOW) else { return }
+
+        create = unsafeBitCast(
+            dlsym(handle, "IOHIDEventSystemClientCreate"),
+            to: CreateFunc?.self
+        )
+        setMatching = unsafeBitCast(
+            dlsym(handle, "IOHIDEventSystemClientSetMatching"),
+            to: SetMatchingFunc?.self
+        )
+        copyServices = unsafeBitCast(
+            dlsym(handle, "IOHIDEventSystemClientCopyServices"),
+            to: CopyServicesFunc?.self
+        )
+        copyEvent = unsafeBitCast(
+            dlsym(handle, "IOHIDServiceClientCopyEvent"),
+            to: CopyEventFunc?.self
+        )
+        getFloatValue = unsafeBitCast(
+            dlsym(handle, "IOHIDEventGetFloatValue"),
+            to: GetFloatValueFunc?.self
+        )
+    }
+
+    private func resetServices() {
+        services = nil
+    }
+
+    private func resetClient() {
+        releaseOpaque(client)
+        client = nil
+    }
+
+    private func releaseOpaque(_ ref: OpaquePointer?) {
+        guard let ref else { return }
+        Unmanaged<AnyObject>.fromOpaque(UnsafeRawPointer(ref)).release()
+    }
+}
+
 private final class SMCConnection {
     private let connection: io_connect_t
     private var keyInfoCache: [UInt32: SMCKeyInfo] = [:]
@@ -516,7 +682,7 @@ private final class SMCConnection {
         defer { IOObjectRelease(service) }
 
         var connect: io_connect_t = 0
-        let result = IOServiceOpen(service, mach_task_self_, kSMCUserClient, &connect)
+        let result = IOServiceOpen(service, machTaskSelf, kSMCUserClient, &connect)
         guard result == KERN_SUCCESS else { return nil }
         connection = connect
     }

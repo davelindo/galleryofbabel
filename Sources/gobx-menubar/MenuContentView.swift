@@ -9,12 +9,10 @@ struct MenuContentView: View {
 
     var body: some View {
         ZStack {
+            AppTheme.popoverBackground
+                .ignoresSafeArea()
+
             VStack(spacing: 6) {
-                footerView
-
-                Divider()
-                    .opacity(0.5)
-
                 headerView
 
                 Divider()
@@ -22,6 +20,11 @@ struct MenuContentView: View {
 
                 contentContainer
                     .frame(maxHeight: .infinity)
+
+                Divider()
+                    .opacity(0.5)
+
+                footerView
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 8)
@@ -37,9 +40,16 @@ struct MenuContentView: View {
     }
 
     private var headerView: some View {
-        HStack(spacing: 2) {
-            ForEach(MenuTab.allCases) { tab in
+        let tabs = MenuTab.allCases
+        return HStack(spacing: 0) {
+            ForEach(Array(tabs.enumerated()), id: \.element) { index, tab in
                 TabButton(tab: tab, selected: $model.selectedTab, namespace: animationNamespace)
+                if index < tabs.count - 1 {
+                    Rectangle()
+                        .fill(AppTheme.tabSeparator)
+                        .frame(width: 1)
+                        .padding(.vertical, 6)
+                }
             }
         }
         .padding(.horizontal, 8)
@@ -214,6 +224,8 @@ struct DashboardView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         let best = model.summary.bestScore
                         let previous = model.summary.personalBestPreviousScore
+                        let cpuvSeries = model.history.map { $0.cpuVerifyRate }
+                        let missSeries = model.history.map { $0.submitMisses }
 
                         if best != nil || previous != nil {
                             HStack(alignment: .top, spacing: 16) {
@@ -246,10 +258,13 @@ struct DashboardView: View {
                             }
                         }
 
-                        if let best = model.summary.bestScore, let top = model.summary.topBestScore {
-                            ProgressView(value: best, total: top * 1.1)
-                                .tint(AppTheme.accent)
-                                .scaleEffect(y: 0.5)
+                        if !cpuvSeries.isEmpty {
+                            RateTrendView(
+                                values: cpuvSeries,
+                                misses: missSeries,
+                                tint: AppTheme.cpu
+                            )
+                            .frame(height: 34)
                         }
                     }
                     .padding(16)
@@ -509,6 +524,7 @@ struct SubmissionsListView: View {
                     SubmissionLineView(
                         time: s.time,
                         score: s.score,
+                        rank: s.rank,
                         seed: s.seed,
                         color: colorForSub(s.kind)
                     )
@@ -626,6 +642,9 @@ struct SettingsView: View {
 
     private var energySection: some View {
         let profile = model.throughputProfile
+        let minFactor = energyProfiles.first?.factor ?? 0.1
+        let maxFactor = energyProfiles.last?.factor ?? 1.0
+        let sliderPadding: CGFloat = 0
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label(profile.marketingName, systemImage: energyIcon(profile))
@@ -636,17 +655,12 @@ struct SettingsView: View {
                     .foregroundStyle(AppTheme.gpu)
             }
 
-            Slider(value: energyValue, in: 0.1...1.0)
+            Slider(value: energyValue, in: minFactor...maxFactor)
                 .tint(AppTheme.gpu)
+                .padding(.horizontal, sliderPadding)
+                .frame(maxWidth: .infinity)
 
-            HStack {
-                ForEach(energyProfiles, id: \.self) { item in
-                    Text("\(Int(item.factor * 100))%")
-                        .font(.system(size: 10, weight: .regular, design: .rounded))
-                        .foregroundStyle(item == profile ? AppTheme.gpu : .secondary)
-                        .frame(maxWidth: .infinity)
-                }
-            }
+            EnergyScaleView(profiles: energyProfiles, selected: profile, trackInset: sliderPadding)
         }
     }
 
@@ -805,7 +819,7 @@ struct TabButton: View {
                         .matchedGeometryEffect(id: "TABBG", in: namespace)
                 }
                 Image(systemName: tab.systemImage)
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
                     .foregroundStyle(selected == tab ? AppTheme.accent : .secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -868,6 +882,97 @@ struct Sparkline: View {
     }
 }
 
+struct RateTrendView: View {
+    let values: [Double]
+    let misses: [UInt64]
+    let tint: Color
+
+    var body: some View {
+        let cleanValues = values.map { $0.isFinite ? max(0.0, $0) : 0.0 }
+        let cleanMisses: [UInt64] = {
+            guard misses.count == values.count else {
+                return Array(repeating: 0, count: values.count)
+            }
+            return misses
+        }()
+
+        GeometryReader { proxy in
+            let w = proxy.size.width
+            let h = proxy.size.height
+            let target = max(2, Int(w))
+            let (points, missBins) = downsample(values: cleanValues, misses: cleanMisses, target: target)
+            let maxVal = max(points.max() ?? 0.0, 1.0)
+            let count = max(points.count, 1)
+
+            ZStack(alignment: .leading) {
+                Path { path in
+                    guard points.count > 1 else { return }
+                    path.move(to: CGPoint(x: 0, y: h))
+                    for (i, v) in points.enumerated() {
+                        let x = w * CGFloat(i) / CGFloat(count - 1)
+                        let y = h * (1 - CGFloat(v / maxVal))
+                        path.addLine(to: CGPoint(x: x, y: y))
+                    }
+                    path.addLine(to: CGPoint(x: w, y: h))
+                    path.closeSubpath()
+                }
+                .fill(
+                    LinearGradient(
+                        colors: [tint.opacity(0.35), tint.opacity(0.0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+
+                Path { path in
+                    guard points.count > 1 else { return }
+                    for (i, v) in points.enumerated() {
+                        let x = w * CGFloat(i) / CGFloat(count - 1)
+                        let y = h * (1 - CGFloat(v / maxVal))
+                        if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
+                        else { path.addLine(to: CGPoint(x: x, y: y)) }
+                    }
+                }
+                .stroke(tint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+
+                ForEach(Array(missBins.enumerated()), id: \.offset) { idx, missCount in
+                    if missCount > 0 {
+                        let x = count > 1 ? (w * CGFloat(idx) / CGFloat(count - 1)) : (w / 2)
+                        Path { path in
+                            path.move(to: CGPoint(x: x, y: 0))
+                            path.addLine(to: CGPoint(x: x, y: h))
+                        }
+                        .stroke(AppTheme.warn.opacity(0.6), lineWidth: 1)
+                    }
+                }
+            }
+        }
+        .clipped()
+    }
+
+    private func downsample(values: [Double], misses: [UInt64], target: Int) -> ([Double], [UInt64]) {
+        guard values.count > target, target > 0 else { return (values, misses) }
+        let chunkSize = Int(ceil(Double(values.count) / Double(target)))
+        var downValues: [Double] = []
+        var downMisses: [UInt64] = []
+        downValues.reserveCapacity(target)
+        downMisses.reserveCapacity(target)
+
+        var idx = 0
+        while idx < values.count {
+            let end = min(idx + chunkSize, values.count)
+            let slice = values[idx..<end]
+            let missSlice = misses[idx..<end]
+            let avg = slice.reduce(0.0, +) / Double(slice.count)
+            let missTotal = missSlice.reduce(0, +)
+            downValues.append(avg)
+            downMisses.append(missTotal)
+            idx = end
+        }
+        return (downValues, downMisses)
+    }
+}
+
 struct LogLineView: View {
     let time: Date
     let message: String
@@ -911,6 +1016,7 @@ struct LogLineView: View {
 struct SubmissionLineView: View {
     let time: Date
     let score: Double
+    let rank: Int?
     let seed: UInt64
     let color: Color
     @State private var hovering = false
@@ -922,6 +1028,11 @@ struct SubmissionLineView: View {
                 .foregroundStyle(.tertiary)
                 .padding(.top, 2)
                 .frame(width: 50, alignment: .leading)
+
+            Text(formatRank(rank))
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(color)
+                .lineLimit(1)
 
             Text(formatScore(score))
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
@@ -940,6 +1051,11 @@ struct SubmissionLineView: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .animation(.easeInOut(duration: 0.15), value: hovering)
+    }
+
+    private func formatRank(_ value: Int?) -> String {
+        guard let value, value > 0 else { return "--" }
+        return "#\(value)"
     }
 
     private func formatScore(_ value: Double) -> String {
@@ -1135,6 +1251,33 @@ struct EnergyRibbon: View {
                 .stroke(AppTheme.warn.opacity(0.35), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.15), radius: 2, x: 0, y: 1)
+    }
+}
+
+struct EnergyScaleView: View {
+    let profiles: [GPUThroughputProfile]
+    let selected: GPUThroughputProfile
+    let trackInset: CGFloat
+
+    var body: some View {
+        GeometryReader { proxy in
+            let minFactor = profiles.first?.factor ?? 0.1
+            let maxFactor = profiles.last?.factor ?? 1.0
+            let span = max(maxFactor - minFactor, 0.0001)
+            let usableWidth = max(proxy.size.width - trackInset * 2, 1)
+
+            ZStack(alignment: .leading) {
+                ForEach(profiles, id: \.self) { item in
+                    let ratio = max(0, min(1, (item.factor - minFactor) / span))
+                    let x = trackInset + usableWidth * CGFloat(ratio)
+                    Text("\(Int(item.factor * 100))%")
+                        .font(.system(size: 10, weight: .regular, design: .rounded))
+                        .foregroundStyle(item == selected ? AppTheme.gpu : .secondary)
+                        .position(x: x, y: 7)
+                }
+            }
+        }
+        .frame(height: 14)
     }
 }
 
@@ -1385,10 +1528,17 @@ struct AppTheme {
     static var error: Color { Color(nsColor: .systemRed) }
     static var tabSelectedFill: Color { Color(nsColor: .selectedControlColor).opacity(0.2) }
     static var tabSelectedStroke: Color { Color(nsColor: .selectedControlColor).opacity(0.45) }
+    static var tabSeparator: Color { Color(nsColor: .separatorColor).opacity(0.3) }
     static var controlFill: Color { Color(nsColor: .controlBackgroundColor).opacity(0.85) }
     static var controlHoverFill: Color { Color(nsColor: .controlBackgroundColor).opacity(1.0) }
     static var controlStroke: Color { Color(nsColor: .separatorColor).opacity(0.6) }
     static var rowHoverFill: Color { Color(nsColor: .tertiaryLabelColor).opacity(0.2) }
+    static var popoverBackground: Color {
+        dynamicColor(
+            light: NSColor.windowBackgroundColor.withAlphaComponent(0.18),
+            dark: .clear
+        )
+    }
 
     private static func dynamicColor(light: NSColor, dark: NSColor) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
