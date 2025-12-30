@@ -48,23 +48,21 @@ final class SystemPowerReader: @unchecked Sendable {
     private let tempHoldSeconds: TimeInterval = 30
     private let minTempC: Double = 20
     private let maxTempC: Double = 150
-    private let smcEnabled: Bool
-    private let hidEnabled: Bool
+    private var smcEnabled = false
+    private var hidEnabled = false
+    private var nextProbeAt: TimeInterval = 0
+    private var probeBackoffSec: TimeInterval = 1.0
+    private let probeMaxSec: TimeInterval = 60.0
 
     init() {
-        let smcOk = smcReader.selfTest()
-        let hidOk = hidTemperatureReader.selfTest()
-        if smcOk || hidOk {
-            smcEnabled = smcOk
-            hidEnabled = hidOk
-        } else {
-            smcEnabled = false
-            hidEnabled = false
-        }
+        let now = Date().timeIntervalSinceReferenceDate
+        probeSensors(now: now)
     }
 
     func snapshot() -> SystemPowerSnapshot {
         lock.withLock {
+            let now = Date().timeIntervalSinceReferenceDate
+            maybeProbeSensors(now: now)
             let batteryInfo = ioReader.readBatteryInfo()
             let smcResult = smcEnabled ? smcReader.readPowerData() : SMCReadResult.empty
             let smc = smcResult.data
@@ -111,6 +109,26 @@ final class SystemPowerReader: @unchecked Sendable {
                 temperatureC: tempC
             )
         }
+    }
+
+    private func maybeProbeSensors(now: TimeInterval) {
+        guard !smcEnabled || !hidEnabled else { return }
+        guard now >= nextProbeAt else { return }
+        probeSensors(now: now)
+    }
+
+    private func probeSensors(now: TimeInterval) {
+        let smcOk = smcEnabled || smcReader.selfTest()
+        let hidOk = hidEnabled || hidTemperatureReader.selfTest()
+        smcEnabled = smcOk
+        hidEnabled = hidOk
+        if smcOk && hidOk {
+            nextProbeAt = .infinity
+            probeBackoffSec = 1.0
+            return
+        }
+        probeBackoffSec = min(probeMaxSec, max(1.0, probeBackoffSec * 2.0))
+        nextProbeAt = now + probeBackoffSec
     }
 
     private func stabilizeTemperature(_ value: Double?) -> Double? {
