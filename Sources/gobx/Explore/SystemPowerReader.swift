@@ -48,11 +48,25 @@ final class SystemPowerReader: @unchecked Sendable {
     private let tempHoldSeconds: TimeInterval = 30
     private let minTempC: Double = 20
     private let maxTempC: Double = 150
+    private let smcEnabled: Bool
+    private let hidEnabled: Bool
+
+    init() {
+        let smcOk = smcReader.selfTest()
+        let hidOk = hidTemperatureReader.selfTest()
+        if smcOk || hidOk {
+            smcEnabled = smcOk
+            hidEnabled = hidOk
+        } else {
+            smcEnabled = false
+            hidEnabled = false
+        }
+    }
 
     func snapshot() -> SystemPowerSnapshot {
         lock.withLock {
             let batteryInfo = ioReader.readBatteryInfo()
-            let smcResult = smcReader.readPowerData()
+            let smcResult = smcEnabled ? smcReader.readPowerData() : SMCReadResult.empty
             let smc = smcResult.data
             let smcPowerAvailable = smcResult.powerAvailable
             let telemetry = batteryInfo?.powerTelemetry
@@ -77,7 +91,7 @@ final class SystemPowerReader: @unchecked Sendable {
             let adapterPower = systemIn.map { $0 + (efficiencyLoss ?? 0.0) }
 
             let smcTemp = smcResult.tempAvailable ? smc.temperature : nil
-            let tempC = stabilizeTemperature(smcTemp ?? hidTemperatureReader.readCPUTemperature())
+            let tempC = stabilizeTemperature(smcTemp ?? (hidEnabled ? hidTemperatureReader.readCPUTemperature() : nil))
             let available = smcPowerAvailable || tempC != nil || batteryInfo != nil
 
             return SystemPowerSnapshot(
@@ -87,8 +101,8 @@ final class SystemPowerReader: @unchecked Sendable {
                 batteryPowerWatts: batteryPower,
                 adapterPowerWatts: adapterPower,
                 efficiencyLossWatts: efficiencyLoss,
-                screenPowerWatts: smc.brightness,
-                heatpipePowerWatts: smc.heatpipe,
+                screenPowerWatts: smcEnabled ? smc.brightness : nil,
+                heatpipePowerWatts: smcEnabled ? smc.heatpipe : nil,
                 adapterWatts: batteryInfo?.adapterWatts,
                 adapterVoltage: batteryInfo?.adapterVoltage,
                 adapterAmperage: batteryInfo?.adapterAmperage,
@@ -234,6 +248,14 @@ fileprivate struct SMCReadResult {
     var powerAvailable: Bool {
         didReadDelivery || didReadSystemTotal || didReadBatteryRate
     }
+
+    static let empty = SMCReadResult(
+        data: .empty,
+        didReadDelivery: false,
+        didReadSystemTotal: false,
+        didReadBatteryRate: false,
+        tempAvailable: false
+    )
 }
 
 private final class SMCReader {
@@ -273,6 +295,11 @@ private final class SMCReader {
     private let maxTempC = 110.0
 
     private var connection: SMCConnection?
+
+    func selfTest() -> Bool {
+        let result = readPowerData()
+        return result.powerAvailable || result.tempAvailable
+    }
 
     func readPowerData() -> SMCReadResult {
         guard let connection = getConnection() else {
@@ -577,6 +604,10 @@ private final class HIDTemperatureReader {
 
     private let eventTypeTemperature: Int64 = 15
     private let temperatureLevelField: UInt32 = 0xf0000
+
+    func selfTest() -> Bool {
+        readCPUTemperature() != nil
+    }
 
     func readCPUTemperature() -> Double? {
         ensureInitialized()
